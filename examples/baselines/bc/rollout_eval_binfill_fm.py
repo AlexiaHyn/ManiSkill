@@ -95,11 +95,26 @@ def parse_args():
     p.add_argument("--context_dim",   type=int, default=256)
     p.add_argument("--hidden_dim",    type=int, default=256)
     p.add_argument("--time_emb_dim",  type=int, default=64)
-    p.add_argument("--action_key",    default="joint_action",
-                   choices=["eef_action", "joint_action", "waypoint_action"])
+    p.add_argument("--action_space",  default="joint_angle",
+                   choices=["joint_angle", "ee_pose"],
+                   help="joint_angle: send 8-D joint targets directly; "
+                        "ee_pose: send 7-D [xyz,rpy,gripper] converted via IK "
+                        "(NOTE: ee_pose may segfault if DemonstrationWrapper's "
+                        "internal planner conflicts with EndeffectorDemonstrationWrapper)")
+    p.add_argument("--action_key",    default=None,
+                   choices=["eef_action", "joint_action", "waypoint_action"],
+                   help="which h5 action field the checkpoint was trained on; "
+                        "defaults to joint_action for joint_angle space, "
+                        "eef_action for ee_pose space")
     p.add_argument("--max_episodes_per_split", type=int, default=None,
                    help="cap episodes per split for quick testing (None = all)")
-    return p.parse_args()
+    args = p.parse_args()
+
+    # derive action_key default from action_space if not explicitly set
+    if args.action_key is None:
+        args.action_key = "joint_action" if args.action_space == "joint_angle" else "eef_action"
+
+    return args
 
 
 # ---------------------------------------------------------------------------
@@ -347,12 +362,14 @@ def main():
     )
     split_map = {"train": train_idx, "val": val_idx}
 
-    # joint_angle avoids the second PandaArmMotionPlanningSolver that ee_pose creates,
-    # which conflicts with the one DemonstrationWrapper already owns → segfault.
+    print(f"Action space : {args.action_space}  (action_key={args.action_key})")
+    if args.action_space == "ee_pose":
+        print("WARNING: ee_pose may segfault if DemonstrationWrapper's internal planner "
+              "conflicts with EndeffectorDemonstrationWrapper. Use joint_angle if unstable.")
     env_builder = BenchmarkEnvBuilder(
         env_id       = "BinFill",
         dataset      = args.dataset,
-        action_space = "joint_angle",
+        action_space = args.action_space,
         gui_render   = False,
         max_steps    = args.max_steps,
     )
