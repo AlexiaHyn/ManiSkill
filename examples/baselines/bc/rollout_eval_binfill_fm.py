@@ -42,6 +42,7 @@ Categorical:
 """
 
 import argparse
+import faulthandler
 import os
 import sys
 import json
@@ -49,6 +50,8 @@ import random
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+faulthandler.enable()  # print Python stack trace on SIGSEGV
 
 import h5py
 import numpy as np
@@ -231,7 +234,9 @@ def run_episode(
     n_steps: int,
     max_steps: int,
 ) -> dict:
+    print("    [run_episode] calling env.reset() ...", flush=True)
     obs, info = env.reset()
+    print("    [run_episode] reset done", flush=True)
     cam_intrinsics  = extract_camera_intrinsics(info)
     task_goal       = info.get("task_goal", [""])[0] if isinstance(info.get("task_goal"), (list, tuple)) else str(info.get("task_goal", ""))
     prev_subgoal    = None
@@ -258,8 +263,10 @@ def run_episode(
                 subtasks_seen.append(current_subgoal)
             prev_subgoal = current_subgoal
 
-        action = policy.sample(cont_t, cat_t, n_steps=n_steps)  # (1, 7)
+        action = policy.sample(cont_t, cat_t, n_steps=n_steps)
         action_np = action.squeeze(0).cpu().numpy().astype(np.float64)
+        if step_count == 0:
+            print(f"    [run_episode] first action shape={action_np.shape} values={action_np}", flush=True)
 
         obs, reward, terminated, truncated, info = env.step(action_np)
         step_count += 1
@@ -369,12 +376,14 @@ def main():
             seed, difficulty = env_builder.resolve_episode(ep_num)
             difficulty = difficulty or "easy"
 
+            print(f"  [ep {ep_num}] make_env_for_episode ...", flush=True)
             env = env_builder.make_env_for_episode(
                 ep_num,
                 max_steps                 = args.max_steps,
                 include_front_camera_intrinsic = True,
                 include_wrist_camera_intrinsic = True,
             )
+            print(f"  [ep {ep_num}] env created, running episode ...", flush=True)
             try:
                 result = run_episode(
                     env, policy, vocabs, difficulty,
