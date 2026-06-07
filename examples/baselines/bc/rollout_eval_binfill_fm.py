@@ -17,7 +17,10 @@ Setup
 
 Action space
 ------------
-eef_action (7-D) = [xyz(3), rpy(3), gripper(1)]  →  action_space="ee_pose", action_repr="rpy"
+Uses action_space="joint_angle" (8-D joint positions + gripper).
+Train the policy with --action_key joint_action to match.
+Using ee_pose wraps the env with an extra IK planner that conflicts with
+DemonstrationWrapper's own planner during reset, causing a segfault.
 
 Observation construction per step
 ----------------------------------
@@ -89,7 +92,7 @@ def parse_args():
     p.add_argument("--context_dim",   type=int, default=256)
     p.add_argument("--hidden_dim",    type=int, default=256)
     p.add_argument("--time_emb_dim",  type=int, default=64)
-    p.add_argument("--action_key",    default="eef_action",
+    p.add_argument("--action_key",    default="joint_action",
                    choices=["eef_action", "joint_action", "waypoint_action"])
     p.add_argument("--max_episodes_per_split", type=int, default=None,
                    help="cap episodes per split for quick testing (None = all)")
@@ -337,11 +340,12 @@ def main():
     )
     split_map = {"train": train_idx, "val": val_idx}
 
-    # ── env builder (action_space="ee_pose" for 7-D [xyz, rpy, gripper]) ──
+    # joint_angle avoids the second PandaArmMotionPlanningSolver that ee_pose creates,
+    # which conflicts with the one DemonstrationWrapper already owns → segfault.
     env_builder = BenchmarkEnvBuilder(
         env_id       = "BinFill",
         dataset      = args.dataset,
-        action_space = "ee_pose",
+        action_space = "joint_angle",
         gui_render   = False,
         max_steps    = args.max_steps,
     )
