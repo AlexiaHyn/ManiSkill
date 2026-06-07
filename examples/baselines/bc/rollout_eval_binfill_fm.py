@@ -304,7 +304,7 @@ def main():
     # ── add robomme to path ──
     robomme_src = os.path.join(args.robomme_root, "src")
     sys.path.insert(0, robomme_src)
-    import robomme.envs  # noqa: F401 — registers BinFill with gym
+    import robomme.robomme_env  # noqa: F401 — registers BinFill (and all tasks) with gym
     from robomme.env_record_wrapper import BenchmarkEnvBuilder
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
