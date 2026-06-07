@@ -276,7 +276,7 @@ def read_cam_intrinsics_from_h5(h5_file: str, ep_num: int) -> Dict[str, np.ndarr
     Using the wrong location returns an identity matrix, which breaks 18/37 obs dims.
     """
     ep_key = f"episode_{ep_num}"
-    fallback = {"front": np.eye(3, np.float32).ravel(), "wrist": np.eye(3, np.float32).ravel()}
+    fallback = {"front": np.eye(3, dtype=np.float32).ravel(), "wrist": np.eye(3, dtype=np.float32).ravel()}
     with h5py.File(h5_file, "r") as f:
         if ep_key not in f or "setup" not in f[ep_key]:
             return fallback
