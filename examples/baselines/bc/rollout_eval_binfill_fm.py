@@ -17,10 +17,30 @@ Setup
 
 Action space
 ------------
-Uses action_space="joint_angle" (8-D joint positions + gripper).
-Train the policy with --action_key joint_action to match.
-Using ee_pose wraps the env with an extra IK planner that conflicts with
-DemonstrationWrapper's own planner during reset, causing a segfault.
+Uses action_space="joint_angle" (8-D joint positions + gripper) by default.
+ee_pose is also supported — the IK planner conflict that caused segfaults in the
+original approach is resolved because bypass_demo_reset() skips
+DemonstrationWrapper.reset() entirely, so DemonstrationWrapper never creates its
+motion planner (EndeffectorDemonstrationWrapper creates its IK planner lazily).
+
+DemonstrationWrapper bypass
+---------------------------
+make_env_for_episode() creates the full wrapper stack:
+  FailAwareWrapper → DemonstrationWrapper → BinFill
+DemonstrationWrapper.reset() would normally replay the full demonstration via a
+motion planner, leaving the robot at the task-completion pose.  bypass_demo_reset()
+skips this by: (1) manually initialising DemonstrationWrapper's episode-level state
+variables, (2) calling the underlying env.reset() so the robot starts at home with
+objects randomised by episode seed.  _step_batch() never reads demonstration_data
+(confirmed from source), so setting it to None is safe.
+
+Live subgoal tracking
+---------------------
+After bypass reset, env.step() goes through the full DemonstrationWrapper stack.
+_augment_obs_and_info() reads BinFill.current_task_name via __getattr__ proxy
+(updated every step by sequential_task_check() based on physics state) and writes
+it to info["simple_subgoal_online"].  This gives correct, live subgoal updates
+without any dependence on the demonstration data.
 
 Observation construction per step
 ----------------------------------
@@ -99,8 +119,8 @@ def parse_args():
                    choices=["joint_angle", "ee_pose"],
                    help="joint_angle: send 8-D joint targets directly; "
                         "ee_pose: send 7-D [xyz,rpy,gripper] converted via IK "
-                        "(NOTE: ee_pose may segfault if DemonstrationWrapper's "
-                        "internal planner conflicts with EndeffectorDemonstrationWrapper)")
+                        "(bypass_demo_reset avoids the double-planner conflict that "
+                        "previously caused a segfault with ee_pose)")
     p.add_argument("--action_key",    default=None,
                    choices=["eef_action", "joint_action", "waypoint_action"],
                    help="which h5 action field the checkpoint was trained on; "
@@ -167,155 +187,247 @@ def get_split_episode_indices(
 
 
 # ---------------------------------------------------------------------------
-# Obs builder from live env step output
+# DemonstrationWrapper bypass — keeps the full wrapper stack, skips demo replay
 # ---------------------------------------------------------------------------
 
-def build_obs_tensor(
-    obs: dict,
-    info: dict,
-    cam_intrinsics: Dict[str, np.ndarray],  # captured once per episode
-    prev_subgoal: Optional[str],
-    vocabs: Dict[str, Vocab],
-    difficulty: str,
-    device: torch.device,
-) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], str]:
-    """
-    Build (cont_tensor, cat_tensor_dict, current_subgoal) from one env step.
-    cam_intrinsics = {"front": (9,), "wrist": (9,)} captured at episode start.
-    """
-    # ── continuous obs ──
-    eef    = np.asarray(obs["eef_state_list"],    dtype=np.float32).flatten()[:6]   # (6,)
-    joint  = np.asarray(obs["joint_state_list"],  dtype=np.float32).flatten()[:7]   # (7,)
-    grip   = np.asarray(obs["gripper_state_list"],dtype=np.float32).flatten()[:2]   # (2,)
-    is_close = np.array([float(grip.mean() < GRIPPER_CLOSE_THRESH)], dtype=np.float32)
+def find_demo_wrapper(env):
+    """Traverse the gymnasium wrapper stack to find the DemonstrationWrapper instance."""
+    current = env
+    while current is not None:
+        if type(current).__name__ == "DemonstrationWrapper":
+            return current
+        current = getattr(current, 'env', None)
+    return None
 
-    status = info.get("status", "ongoing")
-    is_completed     = np.array([1.0 if status == "success" else 0.0], dtype=np.float32)
-    current_subgoal  = str(info.get("simple_subgoal_online", ""))
-    is_subgoal_bound = np.array(
-        [1.0 if (prev_subgoal is not None and current_subgoal != prev_subgoal) else 0.0],
-        dtype=np.float32,
-    )
-    is_video_demo = np.array([0.0], dtype=np.float32)
+
+def bypass_demo_reset(env):
+    """
+    Reset env without running DemonstrationWrapper.reset()'s demo replay.
+
+    DemonstrationWrapper.reset() calls get_demonstration_trajectory() which runs the
+    full demonstration via a motion planner, leaving the robot at the task-completion
+    pose.  This bypass:
+      1. Manually replicates DemonstrationWrapper.reset()'s episode-level state init
+         (lines 149-160 of DemonstrationWrapper.py) without get_demonstration_trajectory()
+      2. Calls demo_wrapper.env.reset() directly — robot at home, objects randomised
+         by episode seed
+      3. Sets demonstration_data = None (safe: _step_batch() never reads it)
+
+    Returns (obs, info, demo_wrapper).  After this call, env.step() goes through the
+    full DemonstrationWrapper stack and provides live subgoal via info["simple_subgoal_online"].
+    """
+    demo_wrapper = find_demo_wrapper(env)
+    if demo_wrapper is None:
+        obs, info = env.reset()
+        return obs, info, None
+
+    # Replicate DemonstrationWrapper.reset() state initialisation (without demo)
+    demo_wrapper.last_subgoal_segment = None
+    demo_wrapper.latched_replacements = None
+    demo_wrapper._failed_match_save_count = 0
+    demo_wrapper.steps_without_demonstration = 0
+    demo_wrapper._prev_ee_quat_wxyz = None
+    demo_wrapper._prev_ee_rpy_xyz = None
+    demo_wrapper.demonstration_data = None  # safe: _step_batch() never reads this
+
+    # Reset the underlying env (robot at home, scene randomised by seed, no demo)
+    obs, info = demo_wrapper.env.reset()
+    demo_wrapper.episode_success = False
+
+    return obs, info, demo_wrapper
+
+
+def _to_numpy(t) -> np.ndarray:
+    if hasattr(t, "detach"):
+        t = t.detach().cpu()
+    return np.asarray(t).flatten()
+
+
+def get_robot_state(env) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Extract eef(6), joint(7), gripper(2) directly from the live SAPIEN env.
+    Works with the raw gym env (no DemonstrationWrapper needed).
+    """
+    from scipy.spatial.transform import Rotation
+
+    base_env = env.unwrapped
+    robot = base_env.agent.robot
+    tcp   = base_env.agent.tcp
+
+    qpos = _to_numpy(robot.qpos).astype(np.float32)
+    joint_state   = qpos[:7]
+    gripper_state = qpos[7:9] if len(qpos) > 7 else np.zeros(2, np.float32)
+
+    p = _to_numpy(tcp.pose.p).astype(np.float32)[:3]
+    q = _to_numpy(tcp.pose.q).astype(np.float32)  # wxyz
+    # wxyz → xyzw for scipy
+    rpy = Rotation.from_quat([q[1], q[2], q[3], q[0]]).as_euler("xyz").astype(np.float32)
+    eef_state = np.concatenate([p, rpy])           # (6,)
+
+    return eef_state, joint_state, gripper_state
+
+
+def read_cam_intrinsics_from_h5(h5_file: str, ep_num: int) -> Dict[str, np.ndarray]:
+    """Read camera intrinsics from h5 (constant per episode, no need for DemonstrationWrapper flags)."""
+    def _get_intrinsic(group, key):
+        if key in group:
+            arr = group[key][()].astype(np.float32).ravel()
+            return arr[:9] if len(arr) >= 9 else np.pad(arr, (0, 9 - len(arr)))
+        return np.eye(3, dtype=np.float32).ravel()
+
+    ep_key = f"episode_{ep_num}"
+    with h5py.File(h5_file, "r") as f:
+        if ep_key not in f:
+            return {"front": np.eye(3, np.float32).ravel(), "wrist": np.eye(3, np.float32).ravel()}
+        ep = f[ep_key]
+        # intrinsics live in the first timestep's info
+        ts_keys = sorted([k for k in ep.keys() if k.startswith("timestep_")],
+                         key=lambda x: int(x.split("_")[1]))
+        if not ts_keys:
+            return {"front": np.eye(3, np.float32).ravel(), "wrist": np.eye(3, np.float32).ravel()}
+        ts_info = ep[ts_keys[0]]["info"]
+        return {
+            "front": _get_intrinsic(ts_info, "front_camera_intrinsic"),
+            "wrist": _get_intrinsic(ts_info, "wrist_camera_intrinsic"),
+        }
+
+
+def build_obs_tensor_raw(
+    eef: np.ndarray,
+    joint: np.ndarray,
+    grip: np.ndarray,
+    cam_intrinsics: Dict[str, np.ndarray],
+    is_completed: float,
+    is_subgoal_bound: float,
+    task_goal: str,
+    difficulty: str,
+    subgoal: str,
+    vocabs: Dict[str, Vocab],
+    device: torch.device,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Build the same 37-D continuous + categorical obs as during training."""
+    is_close = np.array([float(grip.mean() < GRIPPER_CLOSE_THRESH)], np.float32)
 
     cont = np.concatenate([
         eef, joint, grip, is_close,
-        cam_intrinsics["front"],           # (9,)
-        cam_intrinsics["wrist"],           # (9,)
-        is_completed, is_subgoal_bound, is_video_demo,
-    ]).astype(np.float32)                  # (37,)
-
-    cont_t = torch.from_numpy(cont).unsqueeze(0).to(device)  # (1, 37)
-
-    # ── categorical obs ──
-    task_goal_raw = info.get("task_goal", [""])
-    task_goal_str = task_goal_raw[0] if isinstance(task_goal_raw, (list, tuple)) else str(task_goal_raw)
+        cam_intrinsics["front"],
+        cam_intrinsics["wrist"],
+        np.array([is_completed],     np.float32),
+        np.array([is_subgoal_bound], np.float32),
+        np.array([0.0],              np.float32),  # is_video_demo always 0 at rollout
+    ]).astype(np.float32)
+    cont_t = torch.from_numpy(cont).unsqueeze(0).to(device)
 
     cat_t = {
-        "difficulty":     torch.tensor([vocabs["difficulty"](difficulty)],    device=device),
-        "task_goal":      torch.tensor([vocabs["task_goal"](task_goal_str)],  device=device),
-        "simple_subgoal": torch.tensor([vocabs["simple_subgoal"](current_subgoal)], device=device),
+        "difficulty":     torch.tensor([vocabs["difficulty"](difficulty)],  device=device),
+        "task_goal":      torch.tensor([vocabs["task_goal"](task_goal)],    device=device),
+        "simple_subgoal": torch.tensor([vocabs["simple_subgoal"](subgoal)], device=device),
     }
-
-    return cont_t, cat_t, current_subgoal
-
-
-def extract_camera_intrinsics(info: dict) -> Dict[str, np.ndarray]:
-    """Pull camera intrinsics from reset info (constant for the whole episode)."""
-    def _get(key):
-        raw = info.get(key)
-        if raw is None:
-            return np.eye(3, dtype=np.float32).ravel()
-        arr = np.asarray(raw, dtype=np.float32).ravel()
-        return arr[:9] if len(arr) >= 9 else np.pad(arr, (0, 9 - len(arr)))
-
-    return {
-        "front": _get("front_camera_intrinsic"),
-        "wrist": _get("wrist_camera_intrinsic"),
-    }
+    return cont_t, cat_t
 
 
 # ---------------------------------------------------------------------------
-# Single episode rollout
+# Single episode rollout (DemonstrationWrapper bypass for live subgoal tracking)
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
 def run_episode(
     env,
+    task_goal: str,
+    difficulty: str,
+    cam_intrinsics: Dict[str, np.ndarray],
     policy: FlowMatchingPolicy,
     vocabs: Dict[str, Vocab],
-    difficulty: str,
     device: torch.device,
     n_steps: int,
     max_steps: int,
 ) -> dict:
-    print("    [run_episode] calling env.reset() ...", flush=True)
-    obs, info = env.reset()
+    print("    [run_episode] bypass_demo_reset ...", flush=True)
+    _, _, demo_wrapper = bypass_demo_reset(env)
     print("    [run_episode] reset done", flush=True)
-    cam_intrinsics  = extract_camera_intrinsics(info)
-    task_goal       = info.get("task_goal", [""])[0] if isinstance(info.get("task_goal"), (list, tuple)) else str(info.get("task_goal", ""))
-    prev_subgoal    = None
-    subtasks_seen   = []
-    subtasks_done   = []
-    step_count      = 0
 
-    # --- initial subgoal from reset info ---
-    init_subgoal = str(info.get("simple_subgoal_online", ""))
-    if init_subgoal:
-        subtasks_seen.append(init_subgoal)
-        prev_subgoal = init_subgoal
+    # Initial subgoal: BinFill.current_task_name is set during reset's evaluate() call,
+    # accessible via gymnasium.Wrapper.__getattr__ proxy on demo_wrapper.
+    prev_subgoal: str = getattr(demo_wrapper, 'current_task_name', '') if demo_wrapper else ''
+
+    step_count = 0
+    is_completed = 0.0
+    is_subgoal_bound = 0.0
+    subtasks_seen: List[str] = ([prev_subgoal] if prev_subgoal else [])
+    subtasks_done: List[str] = []
 
     while step_count < max_steps:
-        cont_t, cat_t, current_subgoal = build_obs_tensor(
-            obs, info, cam_intrinsics, prev_subgoal, vocabs, difficulty, device
+        eef, joint, grip = get_robot_state(env)
+        cont_t, cat_t = build_obs_tensor_raw(
+            eef, joint, grip, cam_intrinsics,
+            is_completed, is_subgoal_bound,
+            task_goal, difficulty, prev_subgoal, vocabs, device,
         )
-
-        # track subtask transitions
-        if current_subgoal and current_subgoal != prev_subgoal:
-            if prev_subgoal is not None:
-                subtasks_done.append(prev_subgoal)   # completed previous subgoal
-            if current_subgoal not in subtasks_seen:
-                subtasks_seen.append(current_subgoal)
-            prev_subgoal = current_subgoal
 
         action = policy.sample(cont_t, cat_t, n_steps=n_steps)
         action_np = action.squeeze(0).cpu().numpy().astype(np.float64)
         if step_count == 0:
-            print(f"    [run_episode] first action shape={action_np.shape} values={action_np}", flush=True)
+            print(f"    [run_episode] first action shape={action_np.shape} values={action_np}",
+                  flush=True)
 
-        obs, reward, terminated, truncated, info = env.step(action_np)
+        _, _reward, terminated, truncated, info = env.step(action_np)
         step_count += 1
 
+        # Live subgoal from DemonstrationWrapper._augment_obs_and_info() via __getattr__ proxy.
+        # Falls back to reading current_task_name directly if the key is absent.
+        current_subgoal = str(info.get("simple_subgoal_online", ""))
+        if not current_subgoal and demo_wrapper is not None:
+            current_subgoal = getattr(demo_wrapper, 'current_task_name', '') or ''
+
+        # Detect subgoal transition
+        if current_subgoal and current_subgoal != prev_subgoal:
+            is_subgoal_bound = 1.0
+            if prev_subgoal and prev_subgoal not in subtasks_done:
+                subtasks_done.append(prev_subgoal)
+            if current_subgoal not in subtasks_seen:
+                subtasks_seen.append(current_subgoal)
+        else:
+            is_subgoal_bound = 0.0
+        prev_subgoal = current_subgoal
+
+        # DemonstrationWrapper sets info["status"]: "success"/"fail"/"timeout"/"ongoing"/"error"
         status = info.get("status", "ongoing")
-        if status == "error":
+        is_completed = 1.0 if status == "success" else 0.0
+
+        if status == "success":
+            if current_subgoal and current_subgoal not in subtasks_done:
+                subtasks_done.append(current_subgoal)
+            n_seen = max(len(subtasks_seen), 1)
             return {
-                "status": "error",
-                "error_message": info.get("error_message", ""),
+                "status": "success",
                 "steps": step_count,
                 "task_goal": task_goal,
+                "subtask_success_rate": len(subtasks_done) / n_seen,
                 "subtasks_seen": subtasks_seen,
                 "subtasks_done": subtasks_done,
             }
-        if terminated or truncated:
-            # mark last subgoal as done if episode succeeded
-            if status == "success" and prev_subgoal and prev_subgoal not in subtasks_done:
-                subtasks_done.append(prev_subgoal)
+
+        term = _to_numpy(terminated).any() if hasattr(terminated, '__iter__') else bool(terminated)
+        trun = _to_numpy(truncated).any()  if hasattr(truncated,  '__iter__') else bool(truncated)
+        if status in ("fail", "error", "timeout") or term or trun:
+            n_seen = max(len(subtasks_seen), 1)
             return {
-                "status": status,
+                "status": status if status in ("fail", "error", "timeout") else "fail",
                 "steps": step_count,
                 "task_goal": task_goal,
-                "subtasks_seen":   subtasks_seen,
-                "subtasks_done":   subtasks_done,
-                "subtask_success_rate": len(subtasks_done) / max(len(subtasks_seen), 1),
+                "subtask_success_rate": len(subtasks_done) / n_seen,
+                "subtasks_seen": subtasks_seen,
+                "subtasks_done": subtasks_done,
             }
 
+    n_seen = max(len(subtasks_seen), 1)
     return {
         "status": "timeout",
         "steps": step_count,
         "task_goal": task_goal,
-        "subtasks_seen":   subtasks_seen,
-        "subtasks_done":   subtasks_done,
-        "subtask_success_rate": len(subtasks_done) / max(len(subtasks_seen), 1),
+        "subtask_success_rate": len(subtasks_done) / n_seen,
+        "subtasks_seen": subtasks_seen,
+        "subtasks_done": subtasks_done,
     }
 
 
@@ -363,9 +475,9 @@ def main():
     split_map = {"train": train_idx, "val": val_idx}
 
     print(f"Action space : {args.action_space}  (action_key={args.action_key})")
-    if args.action_space == "ee_pose":
-        print("WARNING: ee_pose may segfault if DemonstrationWrapper's internal planner "
-              "conflicts with EndeffectorDemonstrationWrapper. Use joint_angle if unstable.")
+
+    # BenchmarkEnvBuilder creates the full wrapper stack (DemonstrationWrapper + FailAwareWrapper).
+    # bypass_demo_reset() skips DemonstrationWrapper.reset() to avoid demo replay.
     env_builder = BenchmarkEnvBuilder(
         env_id       = "BinFill",
         dataset      = args.dataset,
@@ -383,47 +495,43 @@ def main():
         print(f"\n{'='*60}")
         print(f"SPLIT: {split_name.upper()}  ({len(episode_indices)} episodes)")
         print("="*60)
-        print(f"{'Ep':>4}  {'Status':>8}  {'Steps':>6}  "
-              f"{'SubtaskSR':>10}  {'Done/Seen':>10}  Task goal")
-        print("-"*80)
+        print(f"{'Ep':>4}  {'Status':>8}  {'Steps':>6}  Task goal")
+        print("-"*70)
 
         results = []
         for ep_num in episode_indices:
-            # get difficulty from metadata (needed for categorical embedding)
-            seed, difficulty = env_builder.resolve_episode(ep_num)
+            _, difficulty = env_builder.resolve_episode(ep_num)
             difficulty = difficulty or "easy"
 
-            print(f"  [ep {ep_num}] make_env_for_episode ...", flush=True)
-            env = env_builder.make_env_for_episode(
-                ep_num,
-                max_steps                 = args.max_steps,
-                include_front_camera_intrinsic = True,
-                include_wrist_camera_intrinsic = True,
-            )
-            print(f"  [ep {ep_num}] env created, running episode ...", flush=True)
+            # read task_goal and camera intrinsics from h5 (no DemonstrationWrapper needed)
+            ep_key = f"episode_{ep_num}"
+            with h5py.File(args.h5_file, "r") as f:
+                ep = f[ep_key]
+                tg_raw = ep["setup"]["task_goal"]
+                task_goal = _decode(tg_raw[0] if tg_raw.shape[0] > 0 else tg_raw[()])
+            cam_intrinsics = read_cam_intrinsics_from_h5(args.h5_file, ep_num)
+
+            print(f"  [ep {ep_num}] creating env (DemonstrationWrapper stack) ...", flush=True)
+            env = env_builder.make_env_for_episode(ep_num, max_steps=args.max_steps)
+            print(f"  [ep {ep_num}] env ready, running episode ...", flush=True)
             try:
                 result = run_episode(
-                    env, policy, vocabs, difficulty,
-                    device, args.n_inference_steps, args.max_steps,
+                    env, task_goal, difficulty, cam_intrinsics,
+                    policy, vocabs, device, args.n_inference_steps, args.max_steps,
                 )
             except Exception as e:
                 result = {"status": "error", "error_message": str(e), "steps": 0,
-                          "task_goal": "", "subtasks_seen": [], "subtasks_done": [],
-                          "subtask_success_rate": 0.0}
+                          "task_goal": task_goal, "subtask_success_rate": 0.0,
+                          "subtasks_seen": [], "subtasks_done": []}
             finally:
                 env.close()
 
-            result["episode"] = ep_num
+            result["episode"]    = ep_num
             result["difficulty"] = difficulty
-            result.setdefault("subtask_success_rate",
-                              len(result["subtasks_done"]) / max(len(result["subtasks_seen"]), 1))
             results.append(result)
 
-            status_icon = "✓" if result["status"] == "success" else "✗"
             print(
                 f"{ep_num:>4d}  {result['status']:>8}  {result.get('steps',0):>6d}  "
-                f"{result['subtask_success_rate']:>10.3f}  "
-                f"{len(result['subtasks_done']):>4d}/{len(result['subtasks_seen']):<4d}  "
                 f"{result['task_goal'][:40]}"
             )
 
@@ -448,7 +556,7 @@ def main():
         print(f"  Fail                 : {len(fails)/n:.3f}  ({len(fails)}/{n})")
         print(f"  Timeout              : {len(timeouts)/n:.3f}  ({len(timeouts)}/{n})")
         print(f"  Error                : {len(errors)/n:.3f}  ({len(errors)}/{n})")
-        print(f"  Subtask success rate : {np.mean(sr_list):.3f}  (mean across episodes)")
+        print(f"  Subtask success rate : {np.mean(sr_list):.3f}  (1.0=success, 0.0=fail/timeout)")
         print(f"  Mean steps/episode   : {np.mean(steps_list):.1f}")
 
         print(f"\n  Breakdown by difficulty:")
