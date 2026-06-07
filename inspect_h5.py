@@ -4,20 +4,19 @@ import numpy as np
 FILE = "record_dataset_BinFill.h5"
 
 with h5py.File(FILE, "r") as f:
+    episodes = list(f.keys())
+    print(f"Total episodes: {len(episodes)}")
+
+    ep = f[episodes[0]]
+
+    print(f"\n{'=' * 60}")
+    print(f"TREE FOR: {episodes[0]}")
     print("=" * 60)
-    print("FULL TREE")
-    print("=" * 60)
-    f.visititems(lambda name, obj: print(
+    ep.visititems(lambda name, obj: print(
         name, "->", type(obj).__name__,
         getattr(obj, "shape", ""),
         getattr(obj, "dtype", "")
     ))
-
-    episodes = list(f.keys())
-    print(f"\nTotal episodes: {len(episodes)}")
-    print(f"First 5: {episodes[:5]}")
-
-    ep = f[episodes[0]]
     print(f"\n{'=' * 60}")
     print(f"EPISODE: {episodes[0]}")
     print("=" * 60)
