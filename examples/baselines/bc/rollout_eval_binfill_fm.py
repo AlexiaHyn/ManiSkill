@@ -268,28 +268,25 @@ def get_robot_state(env) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 
 def read_cam_intrinsics_from_h5(h5_file: str, ep_num: int) -> Dict[str, np.ndarray]:
-    """Read camera intrinsics from h5 (constant per episode, no need for DemonstrationWrapper flags)."""
-    def _get_intrinsic(group, key):
-        if key in group:
-            arr = group[key][()].astype(np.float32).ravel()
-            return arr[:9] if len(arr) >= 9 else np.pad(arr, (0, 9 - len(arr)))
-        return np.eye(3, dtype=np.float32).ravel()
+    """
+    Read camera intrinsics from ep["setup"], matching _read_setup_cont() in bc_binfill.py.
 
+    Intrinsics are episode-level constants stored in ep["setup"]["front_camera_intrinsic"]
+    (shape 3×3). They are NOT stored per-timestep in ts["info"].
+    Using the wrong location returns an identity matrix, which breaks 18/37 obs dims.
+    """
     ep_key = f"episode_{ep_num}"
+    fallback = {"front": np.eye(3, np.float32).ravel(), "wrist": np.eye(3, np.float32).ravel()}
     with h5py.File(h5_file, "r") as f:
-        if ep_key not in f:
-            return {"front": np.eye(3, np.float32).ravel(), "wrist": np.eye(3, np.float32).ravel()}
-        ep = f[ep_key]
-        # intrinsics live in the first timestep's info
-        ts_keys = sorted([k for k in ep.keys() if k.startswith("timestep_")],
-                         key=lambda x: int(x.split("_")[1]))
-        if not ts_keys:
-            return {"front": np.eye(3, np.float32).ravel(), "wrist": np.eye(3, np.float32).ravel()}
-        ts_info = ep[ts_keys[0]]["info"]
-        return {
-            "front": _get_intrinsic(ts_info, "front_camera_intrinsic"),
-            "wrist": _get_intrinsic(ts_info, "wrist_camera_intrinsic"),
-        }
+        if ep_key not in f or "setup" not in f[ep_key]:
+            return fallback
+        setup = f[ep_key]["setup"]
+        front = setup["front_camera_intrinsic"][()].astype(np.float32).ravel()
+        wrist = setup["wrist_camera_intrinsic"][()].astype(np.float32).ravel()
+    return {
+        "front": front[:9] if len(front) >= 9 else np.pad(front, (0, 9 - len(front))),
+        "wrist": wrist[:9] if len(wrist) >= 9 else np.pad(wrist, (0, 9 - len(wrist))),
+    }
 
 
 def build_obs_tensor_raw(
