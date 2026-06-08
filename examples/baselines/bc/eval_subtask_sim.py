@@ -44,7 +44,6 @@ for convenience).
 
 import os
 import sys
-import types
 import random
 from collections import Counter, deque
 from dataclasses import dataclass
@@ -254,27 +253,18 @@ class SubtaskQueue:
 @torch.no_grad()
 def run_episode(
     env,
-    policy:               SubtaskFlowMatchingPolicy,
-    device:               torch.device,
-    n_steps:              int,
-    max_steps:            int,
-    obs_horizon:          int,
-    initial_subgoal_text: Optional[str]       = None,
-    initial_raw_state:    Optional[np.ndarray] = None,
+    policy:      SubtaskFlowMatchingPolicy,
+    device:      torch.device,
+    n_steps:     int,
+    max_steps:   int,
+    obs_horizon: int,
 ) -> Dict:
     """
     Execute one full episode driven by the subtask-queue policy.
 
-    For H5 sim eval pass initial_subgoal_text and initial_raw_state (from the
-    H5 first timestep) so the policy's first input exactly matches training.
-    The env must already be constructed with the episode's seed before calling.
-
-    Boundary detection
-    ------------------
-    is_subgoal_boundary=True in the info returned by env.step() means:
-      - The step that was just taken was part of a subtask that has now ended.
-      - The NEW subgoal is already reflected in grounded_subgoal_online.
-    We advance the queue immediately so the NEXT action uses the new subgoal.
+    env must be created via BenchmarkEnvBuilder.make_env_for_episode(), which
+    wraps BinFill with DemonstrationWrapper (providing grounded_subgoal_online)
+    and FailAwareWrapper.
 
     Returns a dict of per-episode metrics.
     """
@@ -283,43 +273,16 @@ def run_episode(
     # Track env.unwrapped.timestep for task boundary detection.
     # DemonstrationWrapper sets allow_subgoal_change_this_timestep=True, so
     # grounded_subgoal_online updates in the same step that a task completes.
-    # We use env.unwrapped.timestep as the trigger and read the new subgoal from info.
     _prev_task_idx = int(getattr(env.unwrapped, "timestep", 0))
 
-    # Initialise rolling state buffer
+    # Initialise rolling state buffer from DemonstrationWrapper obs.
     state_buf = StateBuffer(obs_horizon, policy, device)
-    if initial_raw_state is not None:
-        # Use H5-recorded state so the policy's initial input exactly matches training.
-        state_buf.reset_from_h5(initial_raw_state)
+    state_buf.reset(obs)
 
-        # One-time consistency check: compare H5 state vs DemonstrationWrapper obs.
-        if not hasattr(run_episode, "_state_checked"):
-            run_episode._state_checked = True
-            live_state = _robot_state_from_obs(obs)
-            labels = (
-                [f"joint[{i}]" for i in range(7)] +
-                [f"eef[{i}]"   for i in range(6)] +
-                [f"grip[{i}]"  for i in range(2)] +
-                ["is_grip_close"]
-            )
-            print("\n[STATE CHECK] H5 state[0] vs DemonstrationWrapper obs at reset():")
-            print(f"  {'field':<16}  {'H5':>10}  {'live':>10}  {'diff':>10}")
-            print(f"  {'-'*50}")
-            for lbl, h5v, lv in zip(labels, initial_raw_state, live_state):
-                print(f"  {lbl:<16}  {h5v:>10.5f}  {lv:>10.5f}  {abs(h5v-lv):>10.5f}")
-            print()
-    else:
-        state_buf.reset(obs)
-
-    # Initialise TODO queue.
-    # H5 sim eval: use the H5 subgoal text (exact pixel coords from data collection).
-    # Live sim eval: read grounded_subgoal_online directly from DemonstrationWrapper info.
-    if initial_subgoal_text is not None:
-        initial_sg = initial_subgoal_text
-    else:
-        initial_sg = _decode_info_str(info.get("grounded_subgoal_online", ""))
-        if not initial_sg:
-            initial_sg = "pick up the object"
+    # Read initial subgoal from DemonstrationWrapper.
+    initial_sg = _decode_info_str(info.get("grounded_subgoal_online", ""))
+    if not initial_sg:
+        initial_sg = "pick up the object"
     queue = SubtaskQueue(initial_sg)
 
     ep_steps        = 0
@@ -444,107 +407,99 @@ if __name__ == "__main__":
     print(f"Action std      : {policy.action_std.cpu().numpy()}")
 
     # ── Live simulation evaluation ────────────────────────────────────────
+    # Uses BenchmarkEnvBuilder which correctly wires DemonstrationWrapper
+    # (provides grounded_subgoal_online and proper wrapper stack).
+    # Requires --h5_file to supply the demonstration dataset.
     if not args.skip_sim_eval:
-        try:
-            from robomme.robomme_env.BinFill import BinFill
-            from robomme.env_record_wrapper.DemonstrationWrapper import DemonstrationWrapper
-            from robomme.env_record_wrapper.FailAwareWrapper import FailAwareWrapper
-            _base = BinFill(
-                difficulty   = args.env_difficulty,
-                seed         = args.seed,
-                obs_mode     = "rgb+depth+segmentation",
-                control_mode = "pd_joint_pos",
-                reward_mode  = "dense",
-                render_mode  = "rgb_array",
-            )
-            _base.spec = types.SimpleNamespace(id="BinFill")
-            env = FailAwareWrapper(DemonstrationWrapper(
-                _base,
-                max_steps_without_demonstration = args.max_episode_steps + 2,
-                gui_render = False,
-            ))
-            print(f"\nEnvironment     : BinFill+DemonstrationWrapper  (difficulty={args.env_difficulty})\n")
-        except ImportError as exc:
-            print(f"\n[ERROR] Cannot import RoboMME BinFill: {exc}")
-            print("  Ensure the robomme package is installed:")
-            print("    cd <robomme_benchmark>  &&  pip install -e .")
-            raise
-
-        col = (f"{'Ep':>4}  {'Steps':>5}  {'SubtasksDone':>12}  "
-               f"{'Boundaries':>10}  {'Status':>9}  Subgoal history")
-        print(col)
-        print("-" * 110)
-
-        results: List[Dict] = []
-        for ep_idx in range(args.num_eval_episodes):
-            r = run_episode(
-                env         = env,
-                policy      = policy,
-                device      = device,
-                n_steps     = args.n_inference_steps,
-                max_steps   = args.max_episode_steps,
-                obs_horizon = obs_horizon,
-            )
-            results.append(r)
-            print(
-                f"{ep_idx:>4d}"
-                f"  {r['steps']:>5d}"
-                f"  {r['subtasks_completed']:>12d}"
-                f"  {r['boundary_transitions']:>10d}"
-                f"  {'SUCCESS' if r['episode_success'] else r['final_status']:>9}"
-                f"  {r['subtask_history']}"
-            )
-
-        env.close()
-
-        n_ep                 = len(results)
-        successes            = [r["episode_success"]    for r in results]
-        subtasks_done_list   = [r["subtasks_completed"] for r in results]
-        steps_list           = [r["steps"]              for r in results]
-
-        success_rate         = float(np.mean(successes))
-        mean_subtasks_done   = float(np.mean(subtasks_done_list))
-        total_subtasks_done  = int(np.sum(subtasks_done_list))
-        mean_steps           = float(np.mean(steps_list))
-        status_counts        = Counter(r["final_status"] for r in results)
-
-        if args.expected_subtasks_per_episode is not None:
-            expected = args.expected_subtasks_per_episode
+        if args.h5_file is None:
+            print("\n[SKIP] Live sim eval requires --h5_file (needed by BenchmarkEnvBuilder).")
         else:
-            success_done = [subtasks_done_list[i] for i, s in enumerate(successes) if s]
-            expected = int(np.max(subtasks_done_list)) if not success_done else int(np.mean(success_done))
-        subtask_completion_rate = mean_subtasks_done / max(expected, 1)
+            try:
+                from robomme.env_record_wrapper.episode_config_resolver import BenchmarkEnvBuilder
+            except ImportError as exc:
+                print(f"\n[ERROR] Cannot import BenchmarkEnvBuilder: {exc}")
+                print("  Ensure the robomme package is installed:")
+                print("    cd <robomme_benchmark>  &&  pip install -e .")
+                raise
 
-        print("\n" + "=" * 64)
-        print("SIM EVALUATION SUMMARY")
-        print("=" * 64)
-        print(f"  Episodes evaluated         : {n_ep}")
-        print(f"  Episode success rate       : {success_rate:.3f}"
-              f"  ({int(success_rate*n_ep)}/{n_ep})")
-        print(f"  Mean subtasks completed    : {mean_subtasks_done:.2f}  per episode")
-        print(f"  Expected subtasks/episode  : ~{expected}")
-        print(f"  Subtask completion rate    : {subtask_completion_rate:.3f}")
-        print(f"  Total subtasks completed   : {total_subtasks_done}")
-        print(f"  Mean episode length        : {mean_steps:.1f}  steps")
-        print(f"\n  Episode status breakdown:")
-        for status, count in sorted(status_counts.items(), key=lambda x: -x[1]):
-            print(f"    {status:<12}: {count:>4}  ({count/n_ep:.1%})")
-        print("\n  Per-episode subtask completions:")
-        for r in results:
-            bar = "█" * r["subtasks_completed"]
-            print(f"    {bar:<20}  {r['subtasks_completed']:>2}  "
-                  f"{'✓' if r['episode_success'] else '✗'}")
-        print("=" * 64)
+            env_builder = BenchmarkEnvBuilder(dataset=args.h5_file)
+            print(f"\nEnvironment     : BenchmarkEnvBuilder(BinFill)\n")
+
+            col = (f"{'Ep':>4}  {'Steps':>5}  {'SubtasksDone':>12}  "
+                   f"{'Boundaries':>10}  {'Status':>9}  Subgoal history")
+            print(col)
+            print("-" * 110)
+
+            results: List[Dict] = []
+            for ep_idx in range(args.num_eval_episodes):
+                _live_env = env_builder.make_env_for_episode(ep_idx)
+                r = run_episode(
+                    env         = _live_env,
+                    policy      = policy,
+                    device      = device,
+                    n_steps     = args.n_inference_steps,
+                    max_steps   = args.max_episode_steps,
+                    obs_horizon = obs_horizon,
+                )
+                _live_env.close()
+                results.append(r)
+                print(
+                    f"{ep_idx:>4d}"
+                    f"  {r['steps']:>5d}"
+                    f"  {r['subtasks_completed']:>12d}"
+                    f"  {r['boundary_transitions']:>10d}"
+                    f"  {'SUCCESS' if r['episode_success'] else r['final_status']:>9}"
+                    f"  {r['subtask_history']}"
+                )
+
+            n_ep                 = len(results)
+            successes            = [r["episode_success"]    for r in results]
+            subtasks_done_list   = [r["subtasks_completed"] for r in results]
+            steps_list           = [r["steps"]              for r in results]
+
+            success_rate         = float(np.mean(successes))
+            mean_subtasks_done   = float(np.mean(subtasks_done_list))
+            total_subtasks_done  = int(np.sum(subtasks_done_list))
+            mean_steps           = float(np.mean(steps_list))
+            status_counts        = Counter(r["final_status"] for r in results)
+
+            if args.expected_subtasks_per_episode is not None:
+                expected = args.expected_subtasks_per_episode
+            else:
+                success_done = [subtasks_done_list[i] for i, s in enumerate(successes) if s]
+                expected = int(np.max(subtasks_done_list)) if not success_done else int(np.mean(success_done))
+            subtask_completion_rate = mean_subtasks_done / max(expected, 1)
+
+            print("\n" + "=" * 64)
+            print("SIM EVALUATION SUMMARY")
+            print("=" * 64)
+            print(f"  Episodes evaluated         : {n_ep}")
+            print(f"  Episode success rate       : {success_rate:.3f}"
+                  f"  ({int(success_rate*n_ep)}/{n_ep})")
+            print(f"  Mean subtasks completed    : {mean_subtasks_done:.2f}  per episode")
+            print(f"  Expected subtasks/episode  : ~{expected}")
+            print(f"  Subtask completion rate    : {subtask_completion_rate:.3f}")
+            print(f"  Total subtasks completed   : {total_subtasks_done}")
+            print(f"  Mean episode length        : {mean_steps:.1f}  steps")
+            print(f"\n  Episode status breakdown:")
+            for status, count in sorted(status_counts.items(), key=lambda x: -x[1]):
+                print(f"    {status:<12}: {count:>4}  ({count/n_ep:.1%})")
+            print("\n  Per-episode subtask completions:")
+            for r in results:
+                bar = "█" * r["subtasks_completed"]
+                print(f"    {bar:<20}  {r['subtasks_completed']:>2}  "
+                      f"{'✓' if r['episode_success'] else '✗'}")
+            print("=" * 64)
 
     # ── H5 sim evaluation (train + val splits, exact scene replay) ───────
     if args.h5_file is not None:
         try:
-            from robomme.robomme_env.BinFill import BinFill as _BinFill
-            from robomme.env_record_wrapper.DemonstrationWrapper import DemonstrationWrapper as _DW
-            from robomme.env_record_wrapper.FailAwareWrapper import FailAwareWrapper as _FAW
+            from robomme.env_record_wrapper.episode_config_resolver import BenchmarkEnvBuilder as _BEB
         except ImportError as exc:
-            print(f"\n[ERROR] Cannot import RoboMME BinFill for H5 sim eval: {exc}")
+            print(f"\n[ERROR] Cannot import BenchmarkEnvBuilder for H5 sim eval: {exc}")
             raise
+
+        h5_env_builder = _BEB(dataset=args.h5_file)
 
         print(f"\nLoading H5 episodes from {args.h5_file} ...")
         episodes_subtasks, episode_setups = load_subtasks_from_h5(
@@ -569,41 +524,21 @@ if __name__ == "__main__":
             print(col)
             print("-" * 110)
 
-            # Create a fresh env per episode with the exact H5 seed so the scene
-            # layout is guaranteed to match what the policy was trained on.
             split_results: List[Dict] = []
             for ep_counter, idx in enumerate(indices):
-                setup      = episode_setups[idx]
-                ep_subtasks = episodes_subtasks[idx]
+                setup = episode_setups[idx]
 
-                # Use H5 first-timestep data so the policy's initial input
-                # exactly matches what it saw during training
-                h5_first_state   = ep_subtasks[0]["states"][0]   if ep_subtasks else None
-                h5_first_subgoal = ep_subtasks[0]["subgoal_text"] if ep_subtasks else None
-
-                _h5_base = _BinFill(
-                    difficulty   = setup["difficulty"],
-                    seed         = setup["seed"],
-                    obs_mode     = "rgb+depth+segmentation",
-                    control_mode = "pd_joint_pos",
-                    reward_mode  = "dense",
-                    render_mode  = "rgb_array",
-                )
-                _h5_base.spec = types.SimpleNamespace(id="BinFill")
-                h5_env = _FAW(_DW(
-                    _h5_base,
-                    max_steps_without_demonstration = args.max_episode_steps + 2,
-                    gui_render = False,
-                ))
+                # Parse the integer episode index from the H5 key (e.g. "episode_42" → 42)
+                # so BenchmarkEnvBuilder loads the exact same scene configuration.
+                ep_idx = int(setup["episode_key"].split("_")[1])
+                h5_env = h5_env_builder.make_env_for_episode(ep_idx)
                 r = run_episode(
-                    env                  = h5_env,
-                    policy               = policy,
-                    device               = device,
-                    n_steps              = args.n_inference_steps,
-                    max_steps            = args.max_episode_steps,
-                    obs_horizon          = obs_horizon,
-                    initial_subgoal_text = h5_first_subgoal,
-                    initial_raw_state    = h5_first_state,
+                    env         = h5_env,
+                    policy      = policy,
+                    device      = device,
+                    n_steps     = args.n_inference_steps,
+                    max_steps   = args.max_episode_steps,
+                    obs_horizon = obs_horizon,
                 )
                 h5_env.close()
                 r["difficulty"]  = setup["difficulty"]
