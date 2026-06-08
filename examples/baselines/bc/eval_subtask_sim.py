@@ -52,6 +52,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import torch
 import tyro
+from scipy.spatial.transform import Rotation as _Rotation
 
 # ── imports from training module ──────────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(__file__))
@@ -129,13 +130,15 @@ class StateBuffer:
         self._buf: deque = deque(maxlen=obs_horizon)
 
     def _extract_normalised(self, obs: Dict) -> np.ndarray:
-        joint_state      = np.asarray(obs["joint_state"],      dtype=np.float32).ravel()  # (7,)
-        eef_state        = np.asarray(obs["eef_state"],        dtype=np.float32).ravel()  # (6,)
-        gripper_state    = np.asarray(obs["gripper_state"],    dtype=np.float32).ravel()  # (2,)
+        # RoboMME live env returns list-based obs; [-1] gives the latest frame.
+        # is_gripper_close is not in obs — derive it from gripper width < 0.02 m.
+        joint_state   = np.asarray(obs["joint_state_list"][-1],   dtype=np.float32).ravel()[:7]   # (7,)
+        eef_state     = np.asarray(obs["eef_state_list"][-1],     dtype=np.float32).ravel()[:6]   # (6,)
+        gripper_state = np.asarray(obs["gripper_state_list"][-1], dtype=np.float32).ravel()[:2]   # (2,)
         is_gripper_close = np.array(
-            [float(bool(obs["is_gripper_close"]))], dtype=np.float32
-        )                                                                                   # (1,)
-        raw = np.concatenate([joint_state, eef_state, gripper_state, is_gripper_close])   # (16,)
+            [float(gripper_state.mean() < 0.02)], dtype=np.float32
+        )                                                                                           # (1,)
+        raw = np.concatenate([joint_state, eef_state, gripper_state, is_gripper_close])            # (16,)
         return (raw - self._s_mean) / self._s_std
 
     def reset(self, obs: Dict) -> None:
