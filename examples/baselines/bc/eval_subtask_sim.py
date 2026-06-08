@@ -49,10 +49,10 @@ from collections import Counter, deque
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
+import re
 import numpy as np
 import torch
 import tyro
-from scipy.spatial.transform import Rotation as _Rotation
 from scipy.spatial.transform import Rotation as _Rotation
 
 # ── imports from training module ──────────────────────────────────────────────
@@ -208,6 +208,92 @@ def _decode_info_str(val) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Camera utilities — pixel coordinate computation for BinFill
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _binfill_camera_params():
+    """
+    Compute intrinsic K and extrinsic E for BinFill's fixed front camera.
+    Config (from BinFill._default_sensor_configs):
+      eye=[0.3, 0, 0.4], target=[0, 0, -0.2], fov=pi/2, 256×256.
+    Returns (K [3x3 float64], E [3x4 float64]) in OpenCV convention.
+    """
+    eye    = np.array([0.3, 0.0,  0.4])
+    target = np.array([0.0, 0.0, -0.2])
+    up     = np.array([0.0, 0.0,  1.0])
+
+    z_c = target - eye;  z_c /= np.linalg.norm(z_c)      # forward (into scene)
+    # SAPIEN look_at uses left=cross(up,z), then OpenCV converts right=-left=cross(z,up)
+    x_c = np.cross(z_c, up);  x_c /= np.linalg.norm(x_c)  # right in OpenCV image
+    y_c = np.cross(z_c, x_c)                                # down in OpenCV image
+
+    R = np.stack([x_c, y_c, z_c], axis=0)
+    t = -R @ eye
+    E = np.hstack([R, t.reshape(-1, 1)]).astype(np.float64)
+
+    f = 128.0  # = 256 / (2 * tan(pi/4))
+    K = np.array([[f, 0.0, 128.0],
+                  [0.0, f, 128.0],
+                  [0.0, 0.0,  1.0]], dtype=np.float64)
+    return K, E
+
+
+def _grounded_subgoal_from_env(env, cam_K: np.ndarray, cam_E: np.ndarray) -> str:
+    """
+    Build a grounded_subgoal_online string for the env's CURRENT task by:
+      1. Reading task_list[timestep] for the task name, template, and target segment.
+      2. Projecting the first target object's 3-D position to 2-D pixel coords.
+      3. Filling the '<>' placeholder in the template with '<row, col>'.
+
+    Falls back to the task name (without pixel coords) if projection fails.
+    This is needed because raw BinFill (no DemonstrationWrapper) never sets
+    info['grounded_subgoal_online'], so we compute it ourselves.
+    """
+    try:
+        from robomme.robomme_env.utils.choice_action_mapping import (
+            project_world_to_pixel as _pwp,
+            extract_actor_position_xyz as _eap,
+        )
+    except ImportError:
+        _pwp = _eap = None
+
+    base      = env.unwrapped
+    task_list = getattr(base, "task_list", [])
+    task_idx  = int(getattr(base, "timestep", 0))
+
+    if not task_list or task_idx >= len(task_list):
+        return getattr(base, "current_task_name_online", "") or ""
+
+    task     = task_list[task_idx]
+    name     = task.get("name", "Unknown")
+    template = task.get("subgoal_segment", name) or name
+    segment  = task.get("segment", None)
+
+    if _pwp is None or segment is None:
+        return name
+
+    candidates = segment if isinstance(segment, (list, tuple)) else [segment]
+
+    for obj in candidates:
+        try:
+            world_pos = _eap(obj) if _eap else None
+        except Exception:
+            world_pos = None
+        if world_pos is None:
+            continue
+        try:
+            result = _pwp(world_pos, cam_K, cam_E, (256, 256))
+        except Exception:
+            result = None
+        if result is not None:
+            col, row = int(result[0]), int(result[1])  # [pixel_x, pixel_y]
+            filled = re.sub(r"<[^>]*>", f"<{row}, {col}>", template, count=1)
+            return filled
+
+    return name
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # SubtaskQueue — TODO-queue for one episode
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -291,6 +377,13 @@ def run_episode(
     """
     obs, info = env.reset()
 
+    # Camera params for pixel coordinate computation (fixed in BinFill)
+    _cam_K, _cam_E = _binfill_camera_params()
+    # Track env.unwrapped.timestep for task boundary detection.
+    # Raw BinFill (no DemonstrationWrapper) does NOT set info['is_subgoal_boundary'];
+    # sequential_task_check increments env.unwrapped.timestep when a task completes.
+    _prev_task_idx = int(getattr(env.unwrapped, "timestep", 0))
+
     # Initialise rolling state buffer
     state_buf = StateBuffer(obs_horizon, policy, device)
     if initial_raw_state is not None:
@@ -316,12 +409,15 @@ def run_episode(
     else:
         state_buf.reset(env)
 
-    # Initialise TODO queue — prefer H5 subgoal text (has pixel coordinates);
-    # fall back to live info only when not doing H5 replay
+    # Initialise TODO queue.
+    # H5 sim eval: use H5 subgoal text (exact pixel coords from data collection).
+    # Random sim eval: compute from env's first task + 3-D projection.
     if initial_subgoal_text is not None:
         initial_sg = initial_subgoal_text
     else:
-        initial_sg = _decode_info_str(info.get("grounded_subgoal_online", "pick up the object"))
+        initial_sg = _grounded_subgoal_from_env(env, _cam_K, _cam_E)
+        if not initial_sg:
+            initial_sg = "pick up the object"
     queue = SubtaskQueue(initial_sg)
 
     ep_steps        = 0
@@ -348,45 +444,62 @@ def run_episode(
 
         obs, _reward, terminated, truncated, info = env.step(step_action)
         ep_steps += 1
+        # ManiSkill raw env returns torch tensors; normalise to bool
+        if isinstance(terminated, torch.Tensor):
+            terminated = bool(terminated.any().item())
+        if isinstance(truncated, torch.Tensor):
+            truncated = bool(truncated.any().item())
 
         # Update rolling buffer from SAPIEN state after the step
         state_buf.push(env)
 
         # ── Check for subgoal boundary ────────────────────────────────────
-        is_boundary = info.get("is_subgoal_boundary", False)
-        if isinstance(is_boundary, np.ndarray):
-            is_boundary = bool(is_boundary.item())
-        is_boundary = bool(is_boundary)
+        # Raw BinFill never sets info['is_subgoal_boundary'].  We detect
+        # task transitions by watching env.unwrapped.timestep, which
+        # sequential_task_check increments when the current task's func()
+        # returns True (regardless of allow_subgoal_change_this_timestep).
+        cur_task_idx = int(getattr(env.unwrapped, "timestep", 0))
+        is_boundary  = (cur_task_idx != _prev_task_idx)
+        _prev_task_idx = cur_task_idx
 
         if is_boundary:
-            # The subtask that was just running is complete.
-            # grounded_subgoal_online already holds the NEW subgoal.
-            new_sg = _decode_info_str(info.get("grounded_subgoal_online", queue.current_text))
+            # Task completed; read the NEW task directly from task_list[timestep]
+            # so we don't need to wait for current_task_name_online to refresh.
+            new_sg = _grounded_subgoal_from_env(env, _cam_K, _cam_E)
 
-            # One-time log to verify the live env's subgoal format contains
-            # pixel coordinates that the parser can extract
+            # One-time log to verify pixel coordinate computation
             if not hasattr(run_episode, "_subgoal_logged"):
                 run_episode._subgoal_logged = True
                 parsed = parse_grounded_subgoal(new_sg)
-                print(f"[SUBGOAL CHECK] live env text : '{new_sg}'")
-                print(f"[SUBGOAL CHECK] parsed        : action_type={parsed['action_type']}"
+                print(f"[SUBGOAL CHECK] boundary task → '{new_sg}'")
+                print(f"[SUBGOAL CHECK] parsed : action_type={parsed['action_type']}"
                       f"  color={parsed['color']}"
                       f"  pixel=({parsed['pixel_y']:.4f}, {parsed['pixel_x']:.4f})")
-                if parsed["pixel_y"] == 0.0 and parsed["pixel_x"] == 0.0:
-                    print("[SUBGOAL CHECK] WARNING: pixel coords are (0,0) — "
-                          "subgoal text may be missing coordinates")
 
-            if new_sg != queue.current_text:
+            if new_sg and new_sg != queue.current_text:
                 queue.advance(new_sg)
-            else:
-                # Boundary fired but text didn't change (end of episode boundary).
-                # Count it anyway — the task is done.
-                queue.completed += 1
+            # If new_sg is "" (last task just ended) or matches the current text,
+            # do NOT count here.  The final subtask is counted via episode_success
+            # in: subtasks_completed = queue.completed + (1 if episode_success else 0)
 
         # ── Check episode termination ─────────────────────────────────────
+        # DemonstrationWrapper sets info["status"]; raw BinFill does not.
+        # For raw BinFill we read info["success"] / info["fail"] tensors directly.
         status = _decode_info_str(info.get("status", "ongoing"))
+        _raw_success = info.get("success", False)
+        if isinstance(_raw_success, torch.Tensor):
+            _raw_success = bool(_raw_success.item())
+        _raw_fail = info.get("fail", False)
+        if isinstance(_raw_fail, torch.Tensor):
+            _raw_fail = bool(_raw_fail.item())
+
+        if status == "ongoing" and _raw_success:
+            status = "success"
+        elif status == "ongoing" and _raw_fail:
+            status = "fail"
+
         if terminated or truncated or status in ("success", "fail", "timeout", "error"):
-            episode_success = (status == "success")
+            episode_success = (status == "success") or bool(_raw_success)
             break
 
     # The final subtask has no subsequent boundary transition (the episode ends
