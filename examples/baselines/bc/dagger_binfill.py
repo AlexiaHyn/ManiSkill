@@ -968,6 +968,85 @@ def train_one_round(
 
 
 # ---------------------------------------------------------------------------
+# Episode-level success-rate evaluation
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def eval_policy(
+    env_builder,
+    ep_indices: List[int],
+    policy: FlowMatchingPolicyRich,
+    vocabs: Dict[str, Vocab],
+    device: torch.device,
+    max_steps: int,
+    n_ode_steps: int,
+    max_episodes: Optional[int],
+    h5_file: str,
+    split_name: str = "eval",
+    verbose: bool = False,
+) -> Dict:
+    """
+    Run the policy on up to `max_episodes` episodes and report success rate.
+
+    Returns dict with keys:
+      success_rate  : float  fraction of episodes that ended with status=="success"
+      n_success     : int
+      n_total       : int
+      n_fail        : int
+      n_timeout     : int
+      n_error       : int
+      per_episode   : list of {ep_num, status}
+    """
+    policy.eval()
+    eps = ep_indices[:max_episodes] if max_episodes is not None else ep_indices
+
+    counts = {"success": 0, "fail": 0, "timeout": 0, "error": 0}
+    per_ep: List[Dict] = []
+
+    for ep_num in tqdm(eps, desc=f"Eval [{split_name}]"):
+        cam_intr = read_cam_intrinsics_from_h5(h5_file, ep_num)
+        ep_meta  = read_episode_meta(h5_file, ep_num)
+        env      = None
+        try:
+            env = env_builder.make_env_for_episode(ep_num, max_steps=max_steps)
+            _, outcome = collect_policy_rollout(
+                env, ep_meta, cam_intr, policy, vocabs,
+                device=device, max_steps=max_steps, n_ode_steps=n_ode_steps,
+            )
+        except Exception as exc:
+            if verbose:
+                print(f"[Eval ep {ep_num}] exception: {exc}")
+            outcome = "error"
+        finally:
+            if env is not None:
+                try:
+                    env.close()
+                except Exception:
+                    pass
+
+        bucket = outcome if outcome in counts else "error"
+        counts[bucket] += 1
+        per_ep.append({"ep_num": ep_num, "status": outcome})
+
+    n_total = len(per_ep)
+    sr      = counts["success"] / max(n_total, 1)
+    print(
+        f"  [{split_name}] success={counts['success']}/{n_total}  "
+        f"({sr:.1%})  fail={counts['fail']}  "
+        f"timeout={counts['timeout']}  error={counts['error']}"
+    )
+    return {
+        "success_rate": sr,
+        "n_success":    counts["success"],
+        "n_total":      n_total,
+        "n_fail":       counts["fail"],
+        "n_timeout":    counts["timeout"],
+        "n_error":      counts["error"],
+        "per_episode":  per_ep,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1007,6 +1086,13 @@ def parse_args():
     p.add_argument("--lr",                 type=float, default=3e-4)
     p.add_argument("--batch_size",         type=int, default=256)
     p.add_argument("--num_workers",        type=int, default=0)
+
+    # Evaluation
+    p.add_argument("--eval_episodes",      type=int, default=20,
+                   help="Number of episodes for train/val success-rate evaluation "
+                        "(randomly sampled from each split; None = all)")
+    p.add_argument("--eval_freq",          type=int, default=5000,
+                   help="Evaluate every this many pre-training gradient steps")
 
     p.add_argument("--cuda",               action="store_true", default=True)
     p.add_argument("--no_cuda",            dest="cuda", action="store_false")
@@ -1093,20 +1179,56 @@ def main():
     dataset.add_transitions(h5_transitions)
     print(f"Dataset size after H5 load: {len(dataset)} transitions")
 
-    # ------------------------------------------------------------------
-    # Pre-train on H5 demonstrations
-    # ------------------------------------------------------------------
-    if args.h5_pretrain_iters > 0 and len(dataset) > 0:
-        print(f"\nPre-training on H5 demos for {args.h5_pretrain_iters} iters ...")
-        avg_loss = train_one_round(
-            policy, dataset, optimizer, device,
-            n_iters=args.h5_pretrain_iters,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
+    # Shuffle eval episode lists once (deterministic for reproducibility)
+    rng_eval = np.random.default_rng(args.seed + 99)
+    train_eps_eval = rng_eval.choice(train_eps, size=min(args.eval_episodes, len(train_eps)), replace=False).tolist()
+    val_eps_eval   = rng_eval.choice(val_eps,   size=min(args.eval_episodes, len(val_eps)),   replace=False).tolist()
+
+    def run_eval(tag_prefix: str, global_iter: int) -> None:
+        """Evaluate on train and val splits, log to TensorBoard and stdout."""
+        print(f"\n--- Evaluation at {tag_prefix} (iter {global_iter}) ---")
+        tr = eval_policy(
+            env_builder, train_eps_eval, policy, vocabs, device,
+            max_steps=args.max_steps_ep, n_ode_steps=args.n_ode_steps,
+            max_episodes=args.eval_episodes, h5_file=args.h5_file,
+            split_name="train", verbose=args.verbose,
         )
-        writer.add_scalar("pretrain/loss", avg_loss, 0)
-        print(f"Pre-train avg loss: {avg_loss:.5f}")
+        vl = eval_policy(
+            env_builder, val_eps_eval, policy, vocabs, device,
+            max_steps=args.max_steps_ep, n_ode_steps=args.n_ode_steps,
+            max_episodes=args.eval_episodes, h5_file=args.h5_file,
+            split_name="val", verbose=args.verbose,
+        )
+        writer.add_scalar(f"{tag_prefix}/train_success_rate", tr["success_rate"], global_iter)
+        writer.add_scalar(f"{tag_prefix}/val_success_rate",   vl["success_rate"], global_iter)
+        policy.train()
+
+    # ------------------------------------------------------------------
+    # Pre-train on H5 demonstrations (with periodic eval)
+    # ------------------------------------------------------------------
+    pretrain_global = 0
+    if args.h5_pretrain_iters > 0 and len(dataset) > 0:
+        print(f"\nPre-training on H5 demos for {args.h5_pretrain_iters} iters "
+              f"(eval every {args.eval_freq} iters) ...")
+        remaining = args.h5_pretrain_iters
+        chunk_size = args.eval_freq
+
+        while remaining > 0:
+            iters_this_chunk = min(chunk_size, remaining)
+            avg_loss = train_one_round(
+                policy, dataset, optimizer, device,
+                n_iters=iters_this_chunk,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+            )
+            pretrain_global += iters_this_chunk
+            remaining       -= iters_this_chunk
+            writer.add_scalar("pretrain/loss", avg_loss, pretrain_global)
+            print(f"  [pretrain iter {pretrain_global}/{args.h5_pretrain_iters}]  loss={avg_loss:.5f}")
+            run_eval("pretrain", pretrain_global)
+
         torch.save(policy.state_dict(), str(out_dir / "policy_pretrained.pt"))
+        print(f"Pre-trained checkpoint saved → {out_dir / 'policy_pretrained.pt'}")
 
     # ------------------------------------------------------------------
     # DAgger rounds
@@ -1178,14 +1300,16 @@ def main():
                 # Fallback: add raw expert transitions even without policy states
                 dataset.add_transitions(expert_transitions)
 
-        success_rate = n_success / max(args.episodes_per_round, 1)
-        print(f"Policy success rate this round: {success_rate:.2%}  "
-              f"({n_success}/{args.episodes_per_round})")
+        # Data-collection success rate (informational — confounded with exploration)
+        collection_sr = n_success / max(args.episodes_per_round, 1)
+        print(f"Data-collection success rate: {collection_sr:.2%}  "
+              f"({n_success}/{args.episodes_per_round})  "
+              f"[NOTE: this is the rate during data collection, not a clean eval]")
         print(f"Expert steps: {n_expert_steps}  Policy steps: {n_policy_steps}")
         print(f"Dataset size after rollout: {len(dataset)}")
 
-        writer.add_scalar("dagger/success_rate", success_rate, dagger_round)
-        writer.add_scalar("dagger/dataset_size",  len(dataset),  dagger_round)
+        writer.add_scalar("dagger/collection_success_rate", collection_sr, dagger_round)
+        writer.add_scalar("dagger/dataset_size", len(dataset), dagger_round)
 
         # --- Train on aggregated dataset ---
         print(f"Training for {args.iters_per_round} iters ...")
@@ -1199,7 +1323,29 @@ def main():
         writer.add_scalar("dagger/train_loss", avg_loss, dagger_round)
         print(f"Round {dagger_round+1} train loss: {avg_loss:.5f}")
 
-        # Save checkpoint
+        # --- Dedicated success-rate evaluation (clean, separate from data collection) ---
+        print(f"\nEvaluating after round {dagger_round+1} ...")
+        tr_res = eval_policy(
+            env_builder, train_eps_eval, policy, vocabs, device,
+            max_steps=args.max_steps_ep, n_ode_steps=args.n_ode_steps,
+            max_episodes=args.eval_episodes, h5_file=args.h5_file,
+            split_name="train", verbose=args.verbose,
+        )
+        vl_res = eval_policy(
+            env_builder, val_eps_eval, policy, vocabs, device,
+            max_steps=args.max_steps_ep, n_ode_steps=args.n_ode_steps,
+            max_episodes=args.eval_episodes, h5_file=args.h5_file,
+            split_name="val", verbose=args.verbose,
+        )
+        writer.add_scalar("dagger/train_success_rate", tr_res["success_rate"], dagger_round)
+        writer.add_scalar("dagger/val_success_rate",   vl_res["success_rate"], dagger_round)
+        print(f"  Train success: {tr_res['n_success']}/{tr_res['n_total']} "
+              f"({tr_res['success_rate']:.1%})  |  "
+              f"Val success: {vl_res['n_success']}/{vl_res['n_total']} "
+              f"({vl_res['success_rate']:.1%})")
+        policy.train()
+
+        # Save checkpoint (best by val success rate)
         ckpt_path = out_dir / f"policy_round_{dagger_round+1:03d}.pt"
         torch.save(policy.state_dict(), str(ckpt_path))
         print(f"Checkpoint saved → {ckpt_path}")
@@ -1208,6 +1354,25 @@ def main():
     final_path = out_dir / "policy_final.pt"
     torch.save(policy.state_dict(), str(final_path))
     print(f"\nFinal policy saved → {final_path}")
+
+    # Final evaluation summary
+    print("\n=== Final Evaluation ===")
+    tr_final = eval_policy(
+        env_builder, train_eps_eval, policy, vocabs, device,
+        max_steps=args.max_steps_ep, n_ode_steps=args.n_ode_steps,
+        max_episodes=args.eval_episodes, h5_file=args.h5_file,
+        split_name="train (final)", verbose=args.verbose,
+    )
+    vl_final = eval_policy(
+        env_builder, val_eps_eval, policy, vocabs, device,
+        max_steps=args.max_steps_ep, n_ode_steps=args.n_ode_steps,
+        max_episodes=args.eval_episodes, h5_file=args.h5_file,
+        split_name="val (final)", verbose=args.verbose,
+    )
+    print(f"\nFinal train success rate: {tr_final['success_rate']:.1%}  "
+          f"({tr_final['n_success']}/{tr_final['n_total']})")
+    print(f"Final val   success rate: {vl_final['success_rate']:.1%}  "
+          f"({vl_final['n_success']}/{vl_final['n_total']})")
 
     # Save vocabs for inference
     vocab_path = out_dir / "vocabs.pt"
