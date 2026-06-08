@@ -310,129 +310,85 @@ def _build_env_builder_from_h5(
 # ─────────────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def _rollout_episode_for_record(
-    env,
-    policy:      SubtaskFlowMatchingPolicy,
-    device:      torch.device,
-    n_steps:     int,
-    max_steps:   int,
-    obs_horizon: int,
-) -> tuple:
+def _offline_record_episode(
+    episode_subtasks: List[Dict],
+    policy:           SubtaskFlowMatchingPolicy,
+    device:           torch.device,
+    n_steps:          int,
+    obs_horizon:      int,
+) -> List[dict]:
     """
-    Roll out the BC policy for one episode and collect per-timestep data for
-    H5 recording.
+    Offline recording: run the BC policy on pre-loaded H5 states without any
+    sim interaction, identical to how bc_subtask_train.py processes data.
 
-    Recording semantics (match original RecordWrapper / load_subtasks_from_h5):
-      - Each timestep stores the obs BEFORE the action was taken.
-      - is_subgoal_boundary=True on the FIRST timestep of each new subtask,
-        including timestep 0 (start of episode).
-      - grounded_subgoal_online holds the subgoal that was active when the
-        action was generated (i.e. the label for that (obs, action) pair).
+    episode_subtasks : subtask list for ONE episode from load_subtasks_from_h5.
+        Each subtask dict contains:
+            states         (T, 16) float32  raw un-normalised robot states
+            subgoal_text   str
+            subgoal_parsed dict  {action_type, color, pixel_y, pixel_x}
+        State layout (bc_subtask_train.py convention):
+            [:7]    joint_state
+            [7:13]  eef_state
+            [13:15] gripper_state
+            [15]    is_gripper_close
 
-    Returns
-    -------
-    result : dict  — same keys as run_episode (episode_success, steps, …)
-    timesteps : list[dict]  — one dict per timestep with keys:
-        joint_state        (7,) float32
-        eef_state          (6,) float32
-        gripper_state      (2,) float32
-        is_gripper_close   scalar float32
-        joint_action       (8,) float32
-        grounded_subgoal_online  str
-        is_subgoal_boundary      bool
-        status             str   (info after the action was applied)
+    Obs-horizon stacking uses the same boundary-padding rule as SubtaskDataset:
+    missing past frames at the start of each subtask are filled with the first
+    frame of that subtask (NOT carried over from the previous subtask).
+
+    Returns a list of timestep dicts (schema expected by _write_episode_to_h5).
     """
-    obs, info = env.reset()
+    s_mean = policy.state_mean.cpu().numpy()    # (16,)
+    s_std  = policy.state_std.cpu().numpy()     # (16,)
 
-    state_buf = StateBuffer(obs_horizon, policy, device)
-    state_buf.reset(obs)
-
-    initial_sg = _decode_info_str(info.get("grounded_subgoal_online", ""))
-    if not initial_sg:
-        initial_sg = "pick up the object"
-    queue = SubtaskQueue(initial_sg)
-
-    prev_task_idx   = int(getattr(env.unwrapped, "timestep", 0))
-    next_is_boundary = True   # timestep 0 is always the start of the first subtask
-    ep_steps        = 0
-    episode_success = False
-    status          = "ongoing"
     timesteps: List[dict] = []
 
-    for _ in range(max_steps):
-        # ── Capture raw obs components before the action ──────────────────
-        joint_state      = np.asarray(obs["joint_state_list"][-1],   np.float32).ravel()[:7]
-        eef_state        = np.asarray(obs["eef_state_list"][-1],     np.float32).ravel()[:6]
-        gripper_state    = np.asarray(obs["gripper_state_list"][-1], np.float32).ravel()[:2]
-        is_gripper_close = np.float32(float(np.any(gripper_state < 0.03)))
+    for subtask in episode_subtasks:
+        states    = subtask["states"]           # (T, 16) float32 raw
+        sg_parsed = subtask["subgoal_parsed"]
+        sg_text   = subtask["subgoal_text"]
+        T         = len(states)
+        if T == 0:
+            continue
 
-        # ── Build policy inputs ───────────────────────────────────────────
-        state_tensor              = state_buf.get_stacked()
-        action_type, color, pixel = queue.subgoal_tensors(device)
+        # Normalise the whole subtask's states at once (same as SubtaskDataset)
+        s_norm = (states - s_mean) / s_std      # (T, 16)
 
-        # ── Sample action ─────────────────────────────────────────────────
-        action_tensor = policy.sample(
-            state_tensor, action_type, color, pixel, n_steps=n_steps,
+        # Subgoal tensors are constant across all steps of this subtask
+        action_type = torch.tensor([sg_parsed["action_type"]], dtype=torch.long,    device=device)
+        color       = torch.tensor([sg_parsed["color"]],       dtype=torch.long,    device=device)
+        pixel       = torch.tensor(
+            [[sg_parsed["pixel_y"], sg_parsed["pixel_x"]]], dtype=torch.float32, device=device,
         )
-        action_np = action_tensor.squeeze(0).cpu().numpy()   # (8,) de-normalised
 
-        # Snapshot subgoal label and boundary flag for this timestep
-        step_sg       = queue.current_text
-        step_boundary = next_is_boundary
+        for t in range(T):
+            # Build obs-horizon stack; pad with first frame (boundary padding,
+            # same as SubtaskDataset.__getitem__)
+            frames = []
+            for h in range(obs_horizon):
+                ti = t - (obs_horizon - 1 - h)   # oldest … newest
+                frames.append(s_norm[max(ti, 0)])
+            stacked      = np.concatenate(frames)                      # (obs_horizon*16,)
+            state_tensor = torch.from_numpy(stacked).float().unsqueeze(0).to(device)
 
-        # ── Step environment ──────────────────────────────────────────────
-        obs, _reward, terminated, truncated, info = env.step(action_np)
-        ep_steps += 1
+            # policy.sample() returns de-normalised (8,) joint action
+            action_tensor = policy.sample(state_tensor, action_type, color, pixel, n_steps=n_steps)
+            action_np     = action_tensor.squeeze(0).cpu().numpy()     # (8,)
 
-        if isinstance(terminated, torch.Tensor):
-            terminated = bool(terminated.any().item())
-        if isinstance(truncated, torch.Tensor):
-            truncated = bool(truncated.any().item())
+            # Recover individual obs components from raw state (no sim needed)
+            raw = states[t]
+            timesteps.append({
+                "joint_state":              raw[:7].copy(),
+                "eef_state":               raw[7:13].copy(),
+                "gripper_state":           raw[13:15].copy(),
+                "is_gripper_close":        np.float32(raw[15]),
+                "joint_action":            action_np,
+                "grounded_subgoal_online": sg_text,
+                "is_subgoal_boundary":     (t == 0),   # first step of each subtask
+                "status":                  "offline",
+            })
 
-        status = _decode_info_str(info.get("status", "ongoing"))
-
-        # ── Record timestep (obs before action + action + outcome info) ───
-        timesteps.append({
-            "joint_state":              joint_state,
-            "eef_state":               eef_state,
-            "gripper_state":           gripper_state,
-            "is_gripper_close":        is_gripper_close,
-            "joint_action":            action_np,
-            "grounded_subgoal_online": step_sg,
-            "is_subgoal_boundary":     step_boundary,
-            "status":                  status,
-        })
-
-        # ── Update state buffer ───────────────────────────────────────────
-        state_buf.push(obs)
-
-        # ── Detect subtask boundary ───────────────────────────────────────
-        cur_task_idx = int(getattr(env.unwrapped, "timestep", 0))
-        is_boundary  = (cur_task_idx != prev_task_idx)
-        prev_task_idx = cur_task_idx
-
-        if is_boundary:
-            new_sg = _decode_info_str(info.get("grounded_subgoal_online", ""))
-            if new_sg and new_sg != queue.current_text:
-                queue.advance(new_sg)
-            next_is_boundary = True    # next step is first of new subtask
-        else:
-            next_is_boundary = False
-
-        if terminated or truncated or status in ("success", "fail", "timeout", "error"):
-            episode_success = (status == "success")
-            break
-
-    subtasks_completed = queue.completed + (1 if episode_success else 0)
-    result = {
-        "episode_success":      episode_success,
-        "steps":                ep_steps,
-        "subtasks_completed":   subtasks_completed,
-        "boundary_transitions": queue.completed,
-        "final_status":         status,
-        "subtask_history":      queue.history_str(),
-    }
-    return result, timesteps
+    return timesteps
 
 
 def _write_episode_to_h5(
@@ -768,7 +724,7 @@ if __name__ == "__main__":
         print("=" * 55)
         sys.exit(0)
 
-    # ── BC rollout recording mode ─────────────────────────────────────────────
+    # ── BC offline recording mode ─────────────────────────────────────────────
     if args.record_output is not None:
         if args.h5_file is None:
             print("[ERROR] --h5_file is required for --record_output")
@@ -777,7 +733,7 @@ if __name__ == "__main__":
             print("[ERROR] --checkpoint is required for --record_output")
             sys.exit(1)
 
-        print(f"Mode            : BC rollout recording")
+        print(f"Mode            : BC offline recording (no sim)")
         print(f"H5 source       : {args.h5_file}")
         print(f"Output H5       : {args.record_output}")
         print(f"Checkpoint      : {args.checkpoint}")
@@ -800,70 +756,34 @@ if __name__ == "__main__":
         print(f"obs_horizon     : {obs_horizon}")
         print(f"Policy loaded   : {sum(p.numel() for p in policy.parameters()):,} parameters")
 
-        # ── Build env from H5 metadata (exact seed/difficulty per episode) ──
-        # episode_setups preserves the H5 episode order and provides seed/difficulty/task_goal
-        _, episode_setups = load_subtasks_from_h5(args.h5_file, args.num_eval_episodes)
-        env_builder = _build_env_builder_from_h5(args.h5_file, args.num_eval_episodes)
-        n_to_record = min(args.num_eval_episodes, env_builder.get_episode_num())
-
+        # ── Load all H5 data at once — no env needed ──────────────────────
+        all_subtasks, episode_setups = load_subtasks_from_h5(args.h5_file, args.num_eval_episodes)
+        n_to_record = len(episode_setups)
         print(f"Episodes to record: {n_to_record}\n")
-        col = (f"{'Ep':>4}  {'H5Ep':>5}  {'Steps':>5}  {'Subtasks':>8}  "
-               f"{'Status':>9}  Subgoal history")
-        print(col)
-        print("-" * 100)
 
-        record_results: List[Dict] = []
+        col = f"{'Ep':>4}  {'H5Ep':>5}  {'Timesteps':>9}  {'Subtasks':>8}"
+        print(col)
+        print("-" * 35)
 
         with h5py.File(args.record_output, "w") as hf:
-            for seq_idx in range(n_to_record):
-                setup    = episode_setups[seq_idx]
-                ep_key   = setup["episode_key"]           # original key, e.g. "episode_42"
+            for i, (ep_subtasks, setup) in enumerate(zip(all_subtasks, episode_setups)):
+                ep_key    = setup["episode_key"]
                 h5_ep_idx = int(ep_key.split("_")[1])
 
-                _env = env_builder.make_env_for_episode(seq_idx)
-                result, timesteps = _rollout_episode_for_record(
-                    env         = _env,
-                    policy      = policy,
-                    device      = device,
-                    n_steps     = args.n_inference_steps,
-                    max_steps   = args.max_episode_steps,
-                    obs_horizon = obs_horizon,
-                )
-                _env.close()
-
-                # Write to H5 preserving original episode key for easy cross-reference
-                _write_episode_to_h5(hf, ep_key, setup, timesteps)
-                record_results.append(result)
-
-                print(
-                    f"{seq_idx:>4d}"
-                    f"  {h5_ep_idx:>5d}"
-                    f"  {result['steps']:>5d}"
-                    f"  {result['subtasks_completed']:>8d}"
-                    f"  {'SUCCESS' if result['episode_success'] else result['final_status']:>9}"
-                    f"  {result['subtask_history']}"
+                timesteps = _offline_record_episode(
+                    episode_subtasks = ep_subtasks,
+                    policy           = policy,
+                    device           = device,
+                    n_steps          = args.n_inference_steps,
+                    obs_horizon      = obs_horizon,
                 )
 
-        # ── Recording summary ─────────────────────────────────────────────
-        n_rec        = len(record_results)
-        succ_rate    = float(np.mean([r["episode_success"]    for r in record_results]))
-        mean_sub     = float(np.mean([r["subtasks_completed"] for r in record_results]))
-        mean_steps   = float(np.mean([r["steps"]              for r in record_results]))
-        status_counts = Counter(r["final_status"] for r in record_results)
+                if timesteps:
+                    _write_episode_to_h5(hf, ep_key, setup, timesteps)
 
-        print("\n" + "=" * 64)
-        print("RECORDING SUMMARY")
-        print("=" * 64)
-        print(f"  Episodes recorded          : {n_rec}")
-        print(f"  Output file                : {args.record_output}")
-        print(f"  Episode success rate       : {succ_rate:.3f}"
-              f"  ({int(succ_rate * n_rec)}/{n_rec})")
-        print(f"  Mean subtasks completed    : {mean_sub:.2f}")
-        print(f"  Mean episode length        : {mean_steps:.1f} steps")
-        print(f"\n  Status breakdown:")
-        for st, count in sorted(status_counts.items(), key=lambda x: -x[1]):
-            print(f"    {st:<12}: {count:>4}  ({count/n_rec:.1%})")
-        print("=" * 64)
+                print(f"{i:>4d}  {h5_ep_idx:>5d}  {len(timesteps):>9d}  {len(ep_subtasks):>8d}")
+
+        print(f"\nWrote {n_to_record} episodes → {args.record_output}")
         sys.exit(0)
 
     # ── Policy eval mode ──────────────────────────────────────────────────────
