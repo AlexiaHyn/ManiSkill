@@ -270,6 +270,34 @@ def run_episode(
     """
     obs, info = env.reset()
 
+    # ── One-time diagnostic: print obs and info structure after reset ─────
+    if not hasattr(run_episode, "_reset_printed"):
+        run_episode._reset_printed = True
+        print("\n" + "=" * 60)
+        print("OBS keys after env.reset():")
+        if isinstance(obs, dict):
+            for k, v in obs.items():
+                import numpy as _np
+                if hasattr(v, "__len__"):
+                    try:
+                        arr = _np.asarray(v)
+                        print(f"  {k:<30} shape={arr.shape}  dtype={arr.dtype}"
+                              f"  sample={arr.flat[0]:.4f}")
+                    except Exception:
+                        print(f"  {k:<30} len={len(v)}  type={type(v[0]).__name__}")
+                else:
+                    print(f"  {k:<30} value={v!r}")
+        else:
+            print(f"  (not a dict)  type={type(obs).__name__}")
+        print("\nINFO keys after env.reset():")
+        if isinstance(info, dict):
+            for k, v in info.items():
+                print(f"  {k:<30} type={type(v).__name__}  value={str(v)[:80]!r}")
+        else:
+            print(f"  (not a dict)  type={type(info).__name__}")
+        print("=" * 60 + "\n")
+    # ─────────────────────────────────────────────────────────────────────
+
     # Track env.unwrapped.timestep for task boundary detection.
     # DemonstrationWrapper sets allow_subgoal_change_this_timestep=True, so
     # grounded_subgoal_online updates in the same step that a task completes.
@@ -422,7 +450,7 @@ if __name__ == "__main__":
                 print("    cd <robomme_benchmark>  &&  pip install -e .")
                 raise
 
-            env_builder = BenchmarkEnvBuilder(dataset=args.h5_file)
+            env_builder = BenchmarkEnvBuilder("BinFill", dataset=args.h5_file)
             print(f"\nEnvironment     : BenchmarkEnvBuilder(BinFill)\n")
 
             col = (f"{'Ep':>4}  {'Steps':>5}  {'SubtasksDone':>12}  "
@@ -499,7 +527,7 @@ if __name__ == "__main__":
             print(f"\n[ERROR] Cannot import BenchmarkEnvBuilder for H5 sim eval: {exc}")
             raise
 
-        h5_env_builder = _BEB(dataset=args.h5_file)
+        h5_env_builder = _BEB("BinFill", dataset=args.h5_file)
 
         print(f"\nLoading H5 episodes from {args.h5_file} ...")
         episodes_subtasks, episode_setups = load_subtasks_from_h5(
