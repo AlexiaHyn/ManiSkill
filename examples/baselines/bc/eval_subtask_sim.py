@@ -44,6 +44,7 @@ for convenience).
 
 import os
 import sys
+import types
 import random
 from collections import Counter, deque
 from dataclasses import dataclass
@@ -456,6 +457,7 @@ if __name__ == "__main__":
                 reward_mode  = "dense",
                 render_mode  = "rgb_array",
             )
+            _base.spec = types.SimpleNamespace(id="BinFill")
             env = FailAwareWrapper(DemonstrationWrapper(
                 _base,
                 max_steps_without_demonstration = args.max_episode_steps + 2,
@@ -587,6 +589,7 @@ if __name__ == "__main__":
                     reward_mode  = "dense",
                     render_mode  = "rgb_array",
                 )
+                _h5_base.spec = types.SimpleNamespace(id="BinFill")
                 h5_env = _FAW(_DW(
                     _h5_base,
                     max_steps_without_demonstration = args.max_episode_steps + 2,
