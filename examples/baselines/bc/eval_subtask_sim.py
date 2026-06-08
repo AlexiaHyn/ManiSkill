@@ -61,6 +61,7 @@ from bc_subtask_train import (
     SubtaskFlowMatchingPolicy,
     parse_grounded_subgoal,
     STATE_DIM, ACTION_DIM, ACTION_TYPE_VOCAB, COLOR_VOCAB,
+    load_subtasks_from_h5,
 )
 
 
@@ -100,6 +101,18 @@ class EvalArgs:
     # "array"  → numpy array of shape (8,) — most common
     # "dict"   → {"joint_action": array}   — if env expects a dict
     action_format: str = "array"
+
+    # Offline H5 evaluation (optional — set to skip live-sim eval and/or add offline)
+    h5_file:         Optional[str] = None
+    """If set, also run sim evaluation on H5 episodes (both train and val splits)"""
+    h5_split_seed:   int           = 1
+    """Must match the seed used during training to reproduce the same train/val split"""
+    val_fraction:    float         = 0.2
+    """Must match val_fraction used during training"""
+    num_h5_episodes: Optional[int] = None
+    """Cap on H5 episodes to load; None = all"""
+    skip_sim_eval:   bool          = False
+    """Set True to skip the random live-sim eval and only run H5 sim eval"""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -253,6 +266,9 @@ def run_episode(
     """
     Execute one full episode driven by the subtask-queue policy.
 
+    For H5 sim eval, create the env with the episode's seed before calling
+    this function so the scene exactly matches the recorded episode.
+
     Boundary detection
     ------------------
     is_subgoal_boundary=True in the info returned by env.step() means:
@@ -383,96 +399,173 @@ if __name__ == "__main__":
     print(f"Action mean     : {policy.action_mean.cpu().numpy()}")
     print(f"Action std      : {policy.action_std.cpu().numpy()}")
 
-    # ── Create BinFill environment ────────────────────────────────────────
-    # Adjust the import / constructor to match your local robomme installation.
-    # The env must expose the standard gym interface:
-    #   obs, info = env.reset()
-    #   obs, reward, terminated, truncated, info = env.step(action)
-    # with info containing:
-    #   grounded_subgoal_online  (str / bytes)
-    #   is_subgoal_boundary      (bool)
-    #   status                   (str: "success"/"fail"/"timeout"/"ongoing"/"error")
-    try:
-        from robomme.robomme_env.BinFill import BinFill
-        env = BinFill(difficulty=args.env_difficulty, seed=args.seed)
-        print(f"\nEnvironment     : BinFill  (difficulty={args.env_difficulty})\n")
-    except ImportError as exc:
-        print(f"\n[ERROR] Cannot import RoboMME BinFill: {exc}")
-        print("  Ensure the robomme package is installed:")
-        print("    cd <robomme_benchmark>  &&  pip install -e .")
-        raise
+    # ── Live simulation evaluation ────────────────────────────────────────
+    if not args.skip_sim_eval:
+        try:
+            from robomme.robomme_env.BinFill import BinFill
+            env = BinFill(difficulty=args.env_difficulty, seed=args.seed)
+            print(f"\nEnvironment     : BinFill  (difficulty={args.env_difficulty})\n")
+        except ImportError as exc:
+            print(f"\n[ERROR] Cannot import RoboMME BinFill: {exc}")
+            print("  Ensure the robomme package is installed:")
+            print("    cd <robomme_benchmark>  &&  pip install -e .")
+            raise
 
-    # ── Evaluation loop ───────────────────────────────────────────────────
-    col = (f"{'Ep':>4}  {'Steps':>5}  {'SubtasksDone':>12}  "
-           f"{'Boundaries':>10}  {'Status':>9}  Subgoal history")
-    print(col)
-    print("-" * 110)
+        col = (f"{'Ep':>4}  {'Steps':>5}  {'SubtasksDone':>12}  "
+               f"{'Boundaries':>10}  {'Status':>9}  Subgoal history")
+        print(col)
+        print("-" * 110)
 
-    results: List[Dict] = []
-    for ep_idx in range(args.num_eval_episodes):
-        r = run_episode(
-            env           = env,
-            policy        = policy,
-            device        = device,
-            n_steps       = args.n_inference_steps,
-            max_steps     = args.max_episode_steps,
-            action_format = args.action_format,
-            obs_horizon   = obs_horizon,
-        )
-        results.append(r)
-        print(
-            f"{ep_idx:>4d}"
-            f"  {r['steps']:>5d}"
-            f"  {r['subtasks_completed']:>12d}"
-            f"  {r['boundary_transitions']:>10d}"
-            f"  {'SUCCESS' if r['episode_success'] else r['final_status']:>9}"
-            f"  {r['subtask_history']}"
-        )
+        results: List[Dict] = []
+        for ep_idx in range(args.num_eval_episodes):
+            r = run_episode(
+                env           = env,
+                policy        = policy,
+                device        = device,
+                n_steps       = args.n_inference_steps,
+                max_steps     = args.max_episode_steps,
+                action_format = args.action_format,
+                obs_horizon   = obs_horizon,
+            )
+            results.append(r)
+            print(
+                f"{ep_idx:>4d}"
+                f"  {r['steps']:>5d}"
+                f"  {r['subtasks_completed']:>12d}"
+                f"  {r['boundary_transitions']:>10d}"
+                f"  {'SUCCESS' if r['episode_success'] else r['final_status']:>9}"
+                f"  {r['subtask_history']}"
+            )
 
-    env.close()
+        env.close()
 
-    # ── Aggregate metrics ─────────────────────────────────────────────────
-    n_ep   = len(results)
-    successes            = [r["episode_success"]    for r in results]
-    subtasks_done_list   = [r["subtasks_completed"] for r in results]
-    steps_list           = [r["steps"]              for r in results]
+        n_ep                 = len(results)
+        successes            = [r["episode_success"]    for r in results]
+        subtasks_done_list   = [r["subtasks_completed"] for r in results]
+        steps_list           = [r["steps"]              for r in results]
 
-    success_rate         = float(np.mean(successes))
-    mean_subtasks_done   = float(np.mean(subtasks_done_list))
-    total_subtasks_done  = int(np.sum(subtasks_done_list))
-    mean_steps           = float(np.mean(steps_list))
-    status_counts        = Counter(r["final_status"] for r in results)
+        success_rate         = float(np.mean(successes))
+        mean_subtasks_done   = float(np.mean(subtasks_done_list))
+        total_subtasks_done  = int(np.sum(subtasks_done_list))
+        mean_steps           = float(np.mean(steps_list))
+        status_counts        = Counter(r["final_status"] for r in results)
 
-    # Subtask completion rate
-    if args.expected_subtasks_per_episode is not None:
-        expected = args.expected_subtasks_per_episode
-    else:
-        # Estimate from successful episodes; fall back to max observed
-        success_done = [subtasks_done_list[i] for i, s in enumerate(successes) if s]
-        expected = int(np.max(subtasks_done_list)) if not success_done else int(np.mean(success_done))
-    subtask_completion_rate = mean_subtasks_done / max(expected, 1)
+        if args.expected_subtasks_per_episode is not None:
+            expected = args.expected_subtasks_per_episode
+        else:
+            success_done = [subtasks_done_list[i] for i, s in enumerate(successes) if s]
+            expected = int(np.max(subtasks_done_list)) if not success_done else int(np.mean(success_done))
+        subtask_completion_rate = mean_subtasks_done / max(expected, 1)
 
-    print("\n" + "=" * 64)
-    print("EVALUATION SUMMARY")
-    print("=" * 64)
-    print(f"  Episodes evaluated         : {n_ep}")
-    print(f"  Episode success rate       : {success_rate:.3f}"
-          f"  ({int(success_rate*n_ep)}/{n_ep})")
-    print(f"  Mean subtasks completed    : {mean_subtasks_done:.2f}  per episode")
-    print(f"  Expected subtasks/episode  : ~{expected}")
-    print(f"  Subtask completion rate    : {subtask_completion_rate:.3f}")
-    print(f"  Total subtasks completed   : {total_subtasks_done}")
-    print(f"  Mean episode length        : {mean_steps:.1f}  steps")
-    print(f"\n  Episode status breakdown:")
-    for status, count in sorted(status_counts.items(), key=lambda x: -x[1]):
-        print(f"    {status:<12}: {count:>4}  ({count/n_ep:.1%})")
+        print("\n" + "=" * 64)
+        print("SIM EVALUATION SUMMARY")
+        print("=" * 64)
+        print(f"  Episodes evaluated         : {n_ep}")
+        print(f"  Episode success rate       : {success_rate:.3f}"
+              f"  ({int(success_rate*n_ep)}/{n_ep})")
+        print(f"  Mean subtasks completed    : {mean_subtasks_done:.2f}  per episode")
+        print(f"  Expected subtasks/episode  : ~{expected}")
+        print(f"  Subtask completion rate    : {subtask_completion_rate:.3f}")
+        print(f"  Total subtasks completed   : {total_subtasks_done}")
+        print(f"  Mean episode length        : {mean_steps:.1f}  steps")
+        print(f"\n  Episode status breakdown:")
+        for status, count in sorted(status_counts.items(), key=lambda x: -x[1]):
+            print(f"    {status:<12}: {count:>4}  ({count/n_ep:.1%})")
+        print("\n  Per-episode subtask completions:")
+        for r in results:
+            bar = "█" * r["subtasks_completed"]
+            print(f"    {bar:<20}  {r['subtasks_completed']:>2}  "
+                  f"{'✓' if r['episode_success'] else '✗'}")
+        print("=" * 64)
 
-    # Per-difficulty breakdown (all same here, but useful if mixed)
-    print("\n  Per-episode subtask completions:")
-    for r in results:
-        bar_len = r["subtasks_completed"]
-        bar     = "█" * bar_len
-        print(f"    {bar:<20}  {r['subtasks_completed']:>2}  "
-              f"{'✓' if r['episode_success'] else '✗'}")
+    # ── H5 sim evaluation (train + val splits, exact scene replay) ───────
+    if args.h5_file is not None:
+        try:
+            from robomme.robomme_env.BinFill import BinFill as _BinFill
+        except ImportError as exc:
+            print(f"\n[ERROR] Cannot import RoboMME BinFill for H5 sim eval: {exc}")
+            raise
 
-    print("=" * 64)
+        print(f"\nLoading H5 episode seeds from {args.h5_file} ...")
+        _, episode_setups = load_subtasks_from_h5(args.h5_file, args.num_h5_episodes)
+        n_ep_h5 = len(episode_setups)
+
+        rng   = np.random.default_rng(args.h5_split_seed)
+        order = rng.permutation(n_ep_h5).tolist()
+        n_val = max(1, int(n_ep_h5 * args.val_fraction))
+
+        split_indices = [("TRAIN", order[n_val:]), ("VAL", order[:n_val])]
+        print(f"  Train: {len(order[n_val:])} episodes   Val: {n_val} episodes")
+
+        for split_name, indices in split_indices:
+            print(f"\n{'='*64}")
+            print(f"H5 SIM EVAL — {split_name}  ({len(indices)} episodes)")
+            print(f"{'='*64}")
+
+            col = (f"{'Ep':>4}  {'Steps':>5}  {'SubtasksDone':>12}  "
+                   f"{'Boundaries':>10}  {'Status':>9}  Subgoal history")
+            print(col)
+            print("-" * 110)
+
+            # Create a fresh env per episode with the exact H5 seed so the scene
+            # layout is guaranteed to match what the policy was trained on.
+            split_results: List[Dict] = []
+            for ep_counter, idx in enumerate(indices):
+                setup  = episode_setups[idx]
+                h5_env = _BinFill(difficulty=setup["difficulty"], seed=setup["seed"])
+                r = run_episode(
+                    env           = h5_env,
+                    policy        = policy,
+                    device        = device,
+                    n_steps       = args.n_inference_steps,
+                    max_steps     = args.max_episode_steps,
+                    action_format = args.action_format,
+                    obs_horizon   = obs_horizon,
+                )
+                h5_env.close()
+                r["difficulty"]  = setup["difficulty"]
+                r["episode_key"] = setup["episode_key"]
+                split_results.append(r)
+                print(
+                    f"{ep_counter:>4d}"
+                    f"  {r['steps']:>5d}"
+                    f"  {r['subtasks_completed']:>12d}"
+                    f"  {r['boundary_transitions']:>10d}"
+                    f"  {'SUCCESS' if r['episode_success'] else r['final_status']:>9}"
+                    f"  [{setup['difficulty']}] {r['subtask_history']}"
+                )
+
+            # Aggregate
+            n_h5            = len(split_results)
+            h5_successes    = [r["episode_success"]    for r in split_results]
+            h5_subtasks     = [r["subtasks_completed"] for r in split_results]
+            h5_steps        = [r["steps"]              for r in split_results]
+            h5_status_cnts  = Counter(r["final_status"] for r in split_results)
+
+            h5_success_rate       = float(np.mean(h5_successes))
+            h5_mean_subtasks      = float(np.mean(h5_subtasks))
+            h5_mean_steps         = float(np.mean(h5_steps))
+
+            success_done = [h5_subtasks[i] for i, s in enumerate(h5_successes) if s]
+            h5_expected  = (args.expected_subtasks_per_episode or
+                            (int(np.mean(success_done)) if success_done else int(np.max(h5_subtasks))))
+            h5_subtask_rate = h5_mean_subtasks / max(h5_expected, 1)
+
+            print(f"\n  Episode success rate    : {h5_success_rate:.3f}"
+                  f"  ({int(h5_success_rate*n_h5)}/{n_h5})")
+            print(f"  Mean subtasks completed : {h5_mean_subtasks:.2f}")
+            print(f"  Subtask completion rate : {h5_subtask_rate:.3f}"
+                  f"  (expected ~{h5_expected}/episode)")
+            print(f"  Mean episode length     : {h5_mean_steps:.1f} steps")
+            print(f"  Status breakdown:")
+            for status, count in sorted(h5_status_cnts.items(), key=lambda x: -x[1]):
+                print(f"    {status:<12}: {count:>4}  ({count/n_h5:.1%})")
+
+            # Per-difficulty breakdown if mixed
+            diff_groups = Counter(r["difficulty"] for r in split_results)
+            if len(diff_groups) > 1:
+                print(f"  Per-difficulty success rate:")
+                for diff in sorted(diff_groups):
+                    diff_res = [r for r in split_results if r["difficulty"] == diff]
+                    dr = float(np.mean([r["episode_success"] for r in diff_res]))
+                    print(f"    {diff:<8}: {dr:.3f}  ({int(dr*len(diff_res))}/{len(diff_res)})")
