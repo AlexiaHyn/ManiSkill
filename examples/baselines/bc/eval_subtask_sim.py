@@ -74,12 +74,15 @@ class EvalArgs:
     """Path to .pt file saved by bc_subtask_train.py  (required)"""
 
     # Environment
-    env_difficulty:    str = "easy"
-    """BinFill difficulty level: easy / medium / hard"""
+    dataset:           str           = "val"
+    """Built-in split when h5_file is not set: train (100 ep) / val (50 ep) / test"""
+    h5_file:           Optional[str] = None
+    """If set, override episode metadata from this H5 file so env seeds/difficulties
+    exactly match training data. Overrides --dataset."""
     max_episode_steps: int = 800
     """Hard cap on timesteps per episode (before timeout)"""
     num_eval_episodes: int = 20
-    """Number of episodes to evaluate"""
+    """Number of episodes to evaluate (capped at available count)"""
     expected_subtasks_per_episode: Optional[int] = None
     """For subtask_completion_rate. If None, estimated from mean of completed episodes."""
 
@@ -95,18 +98,6 @@ class EvalArgs:
 
     seed: int  = 42
     cuda: bool = True
-
-    # Offline H5 evaluation (optional — set to skip live-sim eval and/or add offline)
-    h5_file:         Optional[str] = None
-    """If set, also run sim evaluation on H5 episodes (both train and val splits)"""
-    h5_split_seed:   int           = 1
-    """Must match the seed used during training to reproduce the same train/val split"""
-    val_fraction:    float         = 0.2
-    """Must match val_fraction used during training"""
-    num_h5_episodes: Optional[int] = None
-    """Cap on H5 episodes to load; None = all"""
-    skip_sim_eval:   bool          = False
-    """Set True to skip the random live-sim eval and only run H5 sim eval"""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -244,6 +235,64 @@ class SubtaskQueue:
     def history_str(self, max_chars: int = 90) -> str:
         h = " → ".join(self._history)
         return h[:max_chars] + ("…" if len(h) > max_chars else "")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# H5 → BenchmarkEnvBuilder metadata bridge
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_env_builder_from_h5(
+    h5_file: str,
+    num_episodes: Optional[int] = None,
+) -> "BenchmarkEnvBuilder":
+    """
+    Load seed/difficulty from an H5 recording file and create a
+    BenchmarkEnvBuilder whose episode metadata exactly matches the H5 episodes.
+
+    BenchmarkEnvBuilder normally reads from its bundled env_metadata JSON files.
+    By writing a temporary metadata JSON derived from the H5 file and passing it
+    via override_metadata_path, we guarantee that make_env_for_episode(ep_idx)
+    recreates the identical scene (same seed + difficulty) that was used during
+    data collection.
+
+    Returns the BenchmarkEnvBuilder instance.  Caller is responsible for
+    deleting the temp directory if desired (not critical — it is very small).
+    """
+    import json
+    import tempfile
+    from pathlib import Path
+    from robomme.env_record_wrapper.episode_config_resolver import BenchmarkEnvBuilder
+
+    _, episode_setups = load_subtasks_from_h5(h5_file, num_episodes)
+
+    records = []
+    for setup in episode_setups:
+        ep_key = setup["episode_key"]          # e.g. "episode_42"
+        ep_idx = int(ep_key.split("_")[1])
+        records.append({
+            "task":       "BinFill",
+            "episode":    ep_idx,
+            "seed":       setup["seed"],
+            "difficulty": setup["difficulty"],
+        })
+
+    metadata = {
+        "env_id":       "BinFill",
+        "record_count": len(records),
+        "records":      records,
+    }
+
+    # Write to a temp dir; BenchmarkEnvBuilder expects the directory, then
+    # appends "record_dataset_BinFill_metadata.json" itself.
+    tmp_dir = Path(tempfile.mkdtemp(prefix="binfill_meta_"))
+    json_path = tmp_dir / "record_dataset_BinFill_metadata.json"
+    json_path.write_text(json.dumps(metadata, indent=2))
+
+    return BenchmarkEnvBuilder(
+        "BinFill",
+        dataset                = "train",   # satisfies the validation check; real data comes from override
+        override_metadata_path = tmp_dir,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -434,184 +483,93 @@ if __name__ == "__main__":
     print(f"Action mean     : {policy.action_mean.cpu().numpy()}")
     print(f"Action std      : {policy.action_std.cpu().numpy()}")
 
-    # ── Live simulation evaluation ────────────────────────────────────────
-    # Uses BenchmarkEnvBuilder which correctly wires DemonstrationWrapper
-    # (provides grounded_subgoal_online and proper wrapper stack).
-    # Requires --h5_file to supply the demonstration dataset.
-    if not args.skip_sim_eval:
-        if args.h5_file is None:
-            print("\n[SKIP] Live sim eval requires --h5_file (needed by BenchmarkEnvBuilder).")
-        else:
-            try:
-                from robomme.env_record_wrapper.episode_config_resolver import BenchmarkEnvBuilder
-            except ImportError as exc:
-                print(f"\n[ERROR] Cannot import BenchmarkEnvBuilder: {exc}")
-                print("  Ensure the robomme package is installed:")
-                print("    cd <robomme_benchmark>  &&  pip install -e .")
-                raise
-
-            env_builder = BenchmarkEnvBuilder("BinFill", dataset=args.h5_file)
-            print(f"\nEnvironment     : BenchmarkEnvBuilder(BinFill)\n")
-
-            col = (f"{'Ep':>4}  {'Steps':>5}  {'SubtasksDone':>12}  "
-                   f"{'Boundaries':>10}  {'Status':>9}  Subgoal history")
-            print(col)
-            print("-" * 110)
-
-            results: List[Dict] = []
-            for ep_idx in range(args.num_eval_episodes):
-                _live_env = env_builder.make_env_for_episode(ep_idx)
-                r = run_episode(
-                    env         = _live_env,
-                    policy      = policy,
-                    device      = device,
-                    n_steps     = args.n_inference_steps,
-                    max_steps   = args.max_episode_steps,
-                    obs_horizon = obs_horizon,
-                )
-                _live_env.close()
-                results.append(r)
-                print(
-                    f"{ep_idx:>4d}"
-                    f"  {r['steps']:>5d}"
-                    f"  {r['subtasks_completed']:>12d}"
-                    f"  {r['boundary_transitions']:>10d}"
-                    f"  {'SUCCESS' if r['episode_success'] else r['final_status']:>9}"
-                    f"  {r['subtask_history']}"
-                )
-
-            n_ep                 = len(results)
-            successes            = [r["episode_success"]    for r in results]
-            subtasks_done_list   = [r["subtasks_completed"] for r in results]
-            steps_list           = [r["steps"]              for r in results]
-
-            success_rate         = float(np.mean(successes))
-            mean_subtasks_done   = float(np.mean(subtasks_done_list))
-            total_subtasks_done  = int(np.sum(subtasks_done_list))
-            mean_steps           = float(np.mean(steps_list))
-            status_counts        = Counter(r["final_status"] for r in results)
-
-            if args.expected_subtasks_per_episode is not None:
-                expected = args.expected_subtasks_per_episode
-            else:
-                success_done = [subtasks_done_list[i] for i, s in enumerate(successes) if s]
-                expected = int(np.max(subtasks_done_list)) if not success_done else int(np.mean(success_done))
-            subtask_completion_rate = mean_subtasks_done / max(expected, 1)
-
-            print("\n" + "=" * 64)
-            print("SIM EVALUATION SUMMARY")
-            print("=" * 64)
-            print(f"  Episodes evaluated         : {n_ep}")
-            print(f"  Episode success rate       : {success_rate:.3f}"
-                  f"  ({int(success_rate*n_ep)}/{n_ep})")
-            print(f"  Mean subtasks completed    : {mean_subtasks_done:.2f}  per episode")
-            print(f"  Expected subtasks/episode  : ~{expected}")
-            print(f"  Subtask completion rate    : {subtask_completion_rate:.3f}")
-            print(f"  Total subtasks completed   : {total_subtasks_done}")
-            print(f"  Mean episode length        : {mean_steps:.1f}  steps")
-            print(f"\n  Episode status breakdown:")
-            for status, count in sorted(status_counts.items(), key=lambda x: -x[1]):
-                print(f"    {status:<12}: {count:>4}  ({count/n_ep:.1%})")
-            print("\n  Per-episode subtask completions:")
-            for r in results:
-                bar = "█" * r["subtasks_completed"]
-                print(f"    {bar:<20}  {r['subtasks_completed']:>2}  "
-                      f"{'✓' if r['episode_success'] else '✗'}")
-            print("=" * 64)
-
-    # ── H5 sim evaluation (train + val splits, exact scene replay) ───────
+    # ── Benchmark simulation evaluation ──────────────────────────────────
+    # If --h5_file is given, episode seeds/difficulties are taken directly from
+    # the H5 recording so scenes exactly match training data.
+    # Otherwise, BenchmarkEnvBuilder's built-in split metadata is used.
     if args.h5_file is not None:
+        print(f"\nBuilding env metadata from H5: {args.h5_file}")
+        env_builder = _build_env_builder_from_h5(args.h5_file, args.num_eval_episodes)
+        split_desc  = f"H5({args.h5_file})"
+    else:
         try:
-            from robomme.env_record_wrapper.episode_config_resolver import BenchmarkEnvBuilder as _BEB
+            from robomme.env_record_wrapper.episode_config_resolver import BenchmarkEnvBuilder
         except ImportError as exc:
-            print(f"\n[ERROR] Cannot import BenchmarkEnvBuilder for H5 sim eval: {exc}")
+            print(f"\n[ERROR] Cannot import BenchmarkEnvBuilder: {exc}")
+            print("  Ensure the robomme package is installed:")
+            print("    cd <robomme_benchmark>  &&  pip install -e .")
             raise
+        env_builder = BenchmarkEnvBuilder("BinFill", dataset=args.dataset)
+        split_desc  = args.dataset
 
-        h5_env_builder = _BEB("BinFill", dataset=args.h5_file)
+    n_available  = env_builder.get_episode_num()
+    n_to_eval    = min(args.num_eval_episodes, n_available)
 
-        print(f"\nLoading H5 episodes from {args.h5_file} ...")
-        episodes_subtasks, episode_setups = load_subtasks_from_h5(
-            args.h5_file, args.num_h5_episodes
+    print(f"\nDataset         : {split_desc}  ({n_available} episodes available)")
+    print(f"Evaluating      : {n_to_eval} episodes\n")
+
+    col = (f"{'Ep':>4}  {'Steps':>5}  {'SubtasksDone':>12}  "
+           f"{'Boundaries':>10}  {'Status':>9}  Subgoal history")
+    print(col)
+    print("-" * 110)
+
+    results: List[Dict] = []
+    for ep_idx in range(n_to_eval):
+        _env = env_builder.make_env_for_episode(ep_idx)
+        r = run_episode(
+            env         = _env,
+            policy      = policy,
+            device      = device,
+            n_steps     = args.n_inference_steps,
+            max_steps   = args.max_episode_steps,
+            obs_horizon = obs_horizon,
         )
-        n_ep_h5 = len(episode_setups)
+        _env.close()
+        results.append(r)
+        print(
+            f"{ep_idx:>4d}"
+            f"  {r['steps']:>5d}"
+            f"  {r['subtasks_completed']:>12d}"
+            f"  {r['boundary_transitions']:>10d}"
+            f"  {'SUCCESS' if r['episode_success'] else r['final_status']:>9}"
+            f"  {r['subtask_history']}"
+        )
 
-        rng   = np.random.default_rng(args.h5_split_seed)
-        order = rng.permutation(n_ep_h5).tolist()
-        n_val = max(1, int(n_ep_h5 * args.val_fraction))
+    n_ep               = len(results)
+    successes          = [r["episode_success"]    for r in results]
+    subtasks_done_list = [r["subtasks_completed"] for r in results]
+    steps_list         = [r["steps"]              for r in results]
 
-        split_indices = [("TRAIN", order[n_val:]), ("VAL", order[:n_val])]
-        print(f"  Train: {len(order[n_val:])} episodes   Val: {n_val} episodes")
+    success_rate           = float(np.mean(successes))
+    mean_subtasks_done     = float(np.mean(subtasks_done_list))
+    total_subtasks_done    = int(np.sum(subtasks_done_list))
+    mean_steps             = float(np.mean(steps_list))
+    status_counts          = Counter(r["final_status"] for r in results)
 
-        for split_name, indices in split_indices:
-            print(f"\n{'='*64}")
-            print(f"H5 SIM EVAL — {split_name}  ({len(indices)} episodes)")
-            print(f"{'='*64}")
+    if args.expected_subtasks_per_episode is not None:
+        expected = args.expected_subtasks_per_episode
+    else:
+        success_done = [subtasks_done_list[i] for i, s in enumerate(successes) if s]
+        expected = int(np.max(subtasks_done_list)) if not success_done else int(np.mean(success_done))
+    subtask_completion_rate = mean_subtasks_done / max(expected, 1)
 
-            col = (f"{'Ep':>4}  {'Steps':>5}  {'SubtasksDone':>12}  "
-                   f"{'Boundaries':>10}  {'Status':>9}  Subgoal history")
-            print(col)
-            print("-" * 110)
-
-            split_results: List[Dict] = []
-            for ep_counter, idx in enumerate(indices):
-                setup = episode_setups[idx]
-
-                # Parse the integer episode index from the H5 key (e.g. "episode_42" → 42)
-                # so BenchmarkEnvBuilder loads the exact same scene configuration.
-                ep_idx = int(setup["episode_key"].split("_")[1])
-                h5_env = h5_env_builder.make_env_for_episode(ep_idx)
-                r = run_episode(
-                    env         = h5_env,
-                    policy      = policy,
-                    device      = device,
-                    n_steps     = args.n_inference_steps,
-                    max_steps   = args.max_episode_steps,
-                    obs_horizon = obs_horizon,
-                )
-                h5_env.close()
-                r["difficulty"]  = setup["difficulty"]
-                r["episode_key"] = setup["episode_key"]
-                split_results.append(r)
-                print(
-                    f"{ep_counter:>4d}"
-                    f"  {r['steps']:>5d}"
-                    f"  {r['subtasks_completed']:>12d}"
-                    f"  {r['boundary_transitions']:>10d}"
-                    f"  {'SUCCESS' if r['episode_success'] else r['final_status']:>9}"
-                    f"  [{setup['difficulty']}] {r['subtask_history']}"
-                )
-
-            # Aggregate
-            n_h5            = len(split_results)
-            h5_successes    = [r["episode_success"]    for r in split_results]
-            h5_subtasks     = [r["subtasks_completed"] for r in split_results]
-            h5_steps        = [r["steps"]              for r in split_results]
-            h5_status_cnts  = Counter(r["final_status"] for r in split_results)
-
-            h5_success_rate       = float(np.mean(h5_successes))
-            h5_mean_subtasks      = float(np.mean(h5_subtasks))
-            h5_mean_steps         = float(np.mean(h5_steps))
-
-            success_done = [h5_subtasks[i] for i, s in enumerate(h5_successes) if s]
-            h5_expected  = (args.expected_subtasks_per_episode or
-                            (int(np.mean(success_done)) if success_done else int(np.max(h5_subtasks))))
-            h5_subtask_rate = h5_mean_subtasks / max(h5_expected, 1)
-
-            print(f"\n  Episode success rate    : {h5_success_rate:.3f}"
-                  f"  ({int(h5_success_rate*n_h5)}/{n_h5})")
-            print(f"  Mean subtasks completed : {h5_mean_subtasks:.2f}")
-            print(f"  Subtask completion rate : {h5_subtask_rate:.3f}"
-                  f"  (expected ~{h5_expected}/episode)")
-            print(f"  Mean episode length     : {h5_mean_steps:.1f} steps")
-            print(f"  Status breakdown:")
-            for status, count in sorted(h5_status_cnts.items(), key=lambda x: -x[1]):
-                print(f"    {status:<12}: {count:>4}  ({count/n_h5:.1%})")
-
-            # Per-difficulty breakdown if mixed
-            diff_groups = Counter(r["difficulty"] for r in split_results)
-            if len(diff_groups) > 1:
-                print(f"  Per-difficulty success rate:")
-                for diff in sorted(diff_groups):
-                    diff_res = [r for r in split_results if r["difficulty"] == diff]
-                    dr = float(np.mean([r["episode_success"] for r in diff_res]))
-                    print(f"    {diff:<8}: {dr:.3f}  ({int(dr*len(diff_res))}/{len(diff_res)})")
+    print("\n" + "=" * 64)
+    print(f"EVAL SUMMARY  [{args.dataset}]")
+    print("=" * 64)
+    print(f"  Episodes evaluated         : {n_ep}")
+    print(f"  Episode success rate       : {success_rate:.3f}"
+          f"  ({int(success_rate*n_ep)}/{n_ep})")
+    print(f"  Mean subtasks completed    : {mean_subtasks_done:.2f}  per episode")
+    print(f"  Expected subtasks/episode  : ~{expected}")
+    print(f"  Subtask completion rate    : {subtask_completion_rate:.3f}")
+    print(f"  Total subtasks completed   : {total_subtasks_done}")
+    print(f"  Mean episode length        : {mean_steps:.1f}  steps")
+    print(f"\n  Episode status breakdown:")
+    for status, count in sorted(status_counts.items(), key=lambda x: -x[1]):
+        print(f"    {status:<12}: {count:>4}  ({count/n_ep:.1%})")
+    print("\n  Per-episode subtask completions:")
+    for r in results:
+        bar = "█" * r["subtasks_completed"]
+        print(f"    {bar:<20}  {r['subtasks_completed']:>2}  "
+              f"{'✓' if r['episode_success'] else '✗'}")
+    print("=" * 64)
