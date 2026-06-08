@@ -50,6 +50,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import re
+import h5py
 import numpy as np
 import torch
 import tyro
@@ -76,6 +77,11 @@ class EvalArgs:
     replay_h5: bool = False
     """If True, replay stored H5 joint_angle actions in sim (sanity check that
     H5 data achieves success). Requires --h5_file. No policy is needed."""
+    record_output: Optional[str] = None
+    """If set, roll out BC policy on every episode in --h5_file using the exact
+    same seed/difficulty, and write a new H5 file in the same format as the
+    training data. Requires --h5_file and --checkpoint.
+    Pass --num_eval_episodes 100 to cover all episodes."""
 
     # Environment
     dataset:           str           = "val"
@@ -297,6 +303,199 @@ def _build_env_builder_from_h5(
         dataset                = "train",   # satisfies the validation check; real data comes from override
         override_metadata_path = tmp_dir,
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BC rollout recorder
+# ─────────────────────────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def _rollout_episode_for_record(
+    env,
+    policy:      SubtaskFlowMatchingPolicy,
+    device:      torch.device,
+    n_steps:     int,
+    max_steps:   int,
+    obs_horizon: int,
+) -> tuple:
+    """
+    Roll out the BC policy for one episode and collect per-timestep data for
+    H5 recording.
+
+    Recording semantics (match original RecordWrapper / load_subtasks_from_h5):
+      - Each timestep stores the obs BEFORE the action was taken.
+      - is_subgoal_boundary=True on the FIRST timestep of each new subtask,
+        including timestep 0 (start of episode).
+      - grounded_subgoal_online holds the subgoal that was active when the
+        action was generated (i.e. the label for that (obs, action) pair).
+
+    Returns
+    -------
+    result : dict  — same keys as run_episode (episode_success, steps, …)
+    timesteps : list[dict]  — one dict per timestep with keys:
+        joint_state        (7,) float32
+        eef_state          (6,) float32
+        gripper_state      (2,) float32
+        is_gripper_close   scalar float32
+        joint_action       (8,) float32
+        grounded_subgoal_online  str
+        is_subgoal_boundary      bool
+        status             str   (info after the action was applied)
+    """
+    obs, info = env.reset()
+
+    state_buf = StateBuffer(obs_horizon, policy, device)
+    state_buf.reset(obs)
+
+    initial_sg = _decode_info_str(info.get("grounded_subgoal_online", ""))
+    if not initial_sg:
+        initial_sg = "pick up the object"
+    queue = SubtaskQueue(initial_sg)
+
+    prev_task_idx   = int(getattr(env.unwrapped, "timestep", 0))
+    next_is_boundary = True   # timestep 0 is always the start of the first subtask
+    ep_steps        = 0
+    episode_success = False
+    status          = "ongoing"
+    timesteps: List[dict] = []
+
+    for _ in range(max_steps):
+        # ── Capture raw obs components before the action ──────────────────
+        joint_state      = np.asarray(obs["joint_state_list"][-1],   np.float32).ravel()[:7]
+        eef_state        = np.asarray(obs["eef_state_list"][-1],     np.float32).ravel()[:6]
+        gripper_state    = np.asarray(obs["gripper_state_list"][-1], np.float32).ravel()[:2]
+        is_gripper_close = np.float32(float(np.any(gripper_state < 0.03)))
+
+        # ── Build policy inputs ───────────────────────────────────────────
+        state_tensor              = state_buf.get_stacked()
+        action_type, color, pixel = queue.subgoal_tensors(device)
+
+        # ── Sample action ─────────────────────────────────────────────────
+        action_tensor = policy.sample(
+            state_tensor, action_type, color, pixel, n_steps=n_steps,
+        )
+        action_np = action_tensor.squeeze(0).cpu().numpy()   # (8,) de-normalised
+
+        # Snapshot subgoal label and boundary flag for this timestep
+        step_sg       = queue.current_text
+        step_boundary = next_is_boundary
+
+        # ── Step environment ──────────────────────────────────────────────
+        obs, _reward, terminated, truncated, info = env.step(action_np)
+        ep_steps += 1
+
+        if isinstance(terminated, torch.Tensor):
+            terminated = bool(terminated.any().item())
+        if isinstance(truncated, torch.Tensor):
+            truncated = bool(truncated.any().item())
+
+        status = _decode_info_str(info.get("status", "ongoing"))
+
+        # ── Record timestep (obs before action + action + outcome info) ───
+        timesteps.append({
+            "joint_state":              joint_state,
+            "eef_state":               eef_state,
+            "gripper_state":           gripper_state,
+            "is_gripper_close":        is_gripper_close,
+            "joint_action":            action_np,
+            "grounded_subgoal_online": step_sg,
+            "is_subgoal_boundary":     step_boundary,
+            "status":                  status,
+        })
+
+        # ── Update state buffer ───────────────────────────────────────────
+        state_buf.push(obs)
+
+        # ── Detect subtask boundary ───────────────────────────────────────
+        cur_task_idx = int(getattr(env.unwrapped, "timestep", 0))
+        is_boundary  = (cur_task_idx != prev_task_idx)
+        prev_task_idx = cur_task_idx
+
+        if is_boundary:
+            new_sg = _decode_info_str(info.get("grounded_subgoal_online", ""))
+            if new_sg and new_sg != queue.current_text:
+                queue.advance(new_sg)
+            next_is_boundary = True    # next step is first of new subtask
+        else:
+            next_is_boundary = False
+
+        if terminated or truncated or status in ("success", "fail", "timeout", "error"):
+            episode_success = (status == "success")
+            break
+
+    subtasks_completed = queue.completed + (1 if episode_success else 0)
+    result = {
+        "episode_success":      episode_success,
+        "steps":                ep_steps,
+        "subtasks_completed":   subtasks_completed,
+        "boundary_transitions": queue.completed,
+        "final_status":         status,
+        "subtask_history":      queue.history_str(),
+    }
+    return result, timesteps
+
+
+def _write_episode_to_h5(
+    hf:        h5py.File,
+    ep_key:    str,
+    setup:     dict,
+    timesteps: List[dict],
+) -> None:
+    """
+    Write one episode's BC rollout data to an already-open H5 file.
+
+    The schema matches record_dataset_BinFill.h5 so the output can be fed
+    directly to load_subtasks_from_h5 / SubtaskDataset for retraining.
+
+    setup  : dict with keys seed (int), difficulty (str), task_goal (list[str])
+    timesteps : list returned by _rollout_episode_for_record
+    """
+    str_dt = h5py.string_dtype(encoding="utf-8")
+
+    ep_grp = hf.create_group(ep_key)
+
+    # ── Setup group ───────────────────────────────────────────────────────
+    sg = ep_grp.create_group("setup")
+    sg.create_dataset("seed",       data=np.int64(setup["seed"]))
+    sg.create_dataset("difficulty", data=setup["difficulty"],  dtype=str_dt)
+    task_goal = setup["task_goal"]
+    sg.create_dataset(
+        "task_goal",
+        data=np.asarray(task_goal, dtype=object),
+        dtype=str_dt,
+    )
+
+    # ── Timestep groups ───────────────────────────────────────────────────
+    for t_idx, ts in enumerate(timesteps):
+        tg = ep_grp.create_group(f"timestep_{t_idx}")
+
+        # obs
+        og = tg.create_group("obs")
+        og.create_dataset("joint_state",      data=ts["joint_state"])
+        og.create_dataset("eef_state",        data=ts["eef_state"])
+        og.create_dataset("gripper_state",    data=ts["gripper_state"])
+        og.create_dataset("is_gripper_close", data=ts["is_gripper_close"])
+
+        # action
+        ag = tg.create_group("action")
+        ag.create_dataset("joint_action", data=ts["joint_action"])
+
+        # info — store strings as UTF-8 bytes to match RecordWrapper
+        ig = tg.create_group("info")
+        sg_text = ts["grounded_subgoal_online"]
+        ig.create_dataset(
+            "grounded_subgoal_online",
+            data=(sg_text.encode("utf-8") if isinstance(sg_text, str) else sg_text),
+        )
+        ig.create_dataset(
+            "is_subgoal_boundary",
+            data=np.bool_(ts["is_subgoal_boundary"]),
+        )
+        status_str = ts["status"]
+        ig.create_dataset(
+            "status",
+            data=(status_str.encode("utf-8") if isinstance(status_str, str) else status_str),
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -567,6 +766,104 @@ if __name__ == "__main__":
         for st, count in sorted(status_counts.items(), key=lambda x: -x[1]):
             print(f"    {st:<12}: {count:>4}  ({count/n_ep:.1%})")
         print("=" * 55)
+        sys.exit(0)
+
+    # ── BC rollout recording mode ─────────────────────────────────────────────
+    if args.record_output is not None:
+        if args.h5_file is None:
+            print("[ERROR] --h5_file is required for --record_output")
+            sys.exit(1)
+        if args.checkpoint is None:
+            print("[ERROR] --checkpoint is required for --record_output")
+            sys.exit(1)
+
+        print(f"Mode            : BC rollout recording")
+        print(f"H5 source       : {args.h5_file}")
+        print(f"Output H5       : {args.record_output}")
+        print(f"Checkpoint      : {args.checkpoint}")
+        print(f"ODE steps       : {args.n_inference_steps}")
+
+        # ── Load policy ───────────────────────────────────────────────────
+        ckpt       = torch.load(args.checkpoint, map_location=device, weights_only=False)
+        state_dict = ckpt["policy_state_dict"] if isinstance(ckpt, dict) and "policy_state_dict" in ckpt else ckpt
+        obs_horizon = int(state_dict.get("obs_horizon_buf", torch.tensor(1)).item())
+
+        policy = SubtaskFlowMatchingPolicy(
+            obs_horizon  = obs_horizon,
+            embed_dim    = args.embed_dim,
+            context_dim  = args.context_dim,
+            hidden_dim   = args.hidden_dim,
+            time_emb_dim = args.time_emb_dim,
+        ).to(device)
+        policy.load_state_dict(state_dict)
+        policy.eval()
+        print(f"obs_horizon     : {obs_horizon}")
+        print(f"Policy loaded   : {sum(p.numel() for p in policy.parameters()):,} parameters")
+
+        # ── Build env from H5 metadata (exact seed/difficulty per episode) ──
+        # episode_setups preserves the H5 episode order and provides seed/difficulty/task_goal
+        _, episode_setups = load_subtasks_from_h5(args.h5_file, args.num_eval_episodes)
+        env_builder = _build_env_builder_from_h5(args.h5_file, args.num_eval_episodes)
+        n_to_record = min(args.num_eval_episodes, env_builder.get_episode_num())
+
+        print(f"Episodes to record: {n_to_record}\n")
+        col = (f"{'Ep':>4}  {'H5Ep':>5}  {'Steps':>5}  {'Subtasks':>8}  "
+               f"{'Status':>9}  Subgoal history")
+        print(col)
+        print("-" * 100)
+
+        record_results: List[Dict] = []
+
+        with h5py.File(args.record_output, "w") as hf:
+            for seq_idx in range(n_to_record):
+                setup    = episode_setups[seq_idx]
+                ep_key   = setup["episode_key"]           # original key, e.g. "episode_42"
+                h5_ep_idx = int(ep_key.split("_")[1])
+
+                _env = env_builder.make_env_for_episode(seq_idx)
+                result, timesteps = _rollout_episode_for_record(
+                    env         = _env,
+                    policy      = policy,
+                    device      = device,
+                    n_steps     = args.n_inference_steps,
+                    max_steps   = args.max_episode_steps,
+                    obs_horizon = obs_horizon,
+                )
+                _env.close()
+
+                # Write to H5 preserving original episode key for easy cross-reference
+                _write_episode_to_h5(hf, ep_key, setup, timesteps)
+                record_results.append(result)
+
+                print(
+                    f"{seq_idx:>4d}"
+                    f"  {h5_ep_idx:>5d}"
+                    f"  {result['steps']:>5d}"
+                    f"  {result['subtasks_completed']:>8d}"
+                    f"  {'SUCCESS' if result['episode_success'] else result['final_status']:>9}"
+                    f"  {result['subtask_history']}"
+                )
+
+        # ── Recording summary ─────────────────────────────────────────────
+        n_rec        = len(record_results)
+        succ_rate    = float(np.mean([r["episode_success"]    for r in record_results]))
+        mean_sub     = float(np.mean([r["subtasks_completed"] for r in record_results]))
+        mean_steps   = float(np.mean([r["steps"]              for r in record_results]))
+        status_counts = Counter(r["final_status"] for r in record_results)
+
+        print("\n" + "=" * 64)
+        print("RECORDING SUMMARY")
+        print("=" * 64)
+        print(f"  Episodes recorded          : {n_rec}")
+        print(f"  Output file                : {args.record_output}")
+        print(f"  Episode success rate       : {succ_rate:.3f}"
+              f"  ({int(succ_rate * n_rec)}/{n_rec})")
+        print(f"  Mean subtasks completed    : {mean_sub:.2f}")
+        print(f"  Mean episode length        : {mean_steps:.1f} steps")
+        print(f"\n  Status breakdown:")
+        for st, count in sorted(status_counts.items(), key=lambda x: -x[1]):
+            print(f"    {st:<12}: {count:>4}  ({count/n_rec:.1%})")
+        print("=" * 64)
         sys.exit(0)
 
     # ── Policy eval mode ──────────────────────────────────────────────────────
