@@ -53,6 +53,7 @@ import numpy as np
 import torch
 import tyro
 from scipy.spatial.transform import Rotation as _Rotation
+from scipy.spatial.transform import Rotation as _Rotation
 
 # ── imports from training module ──────────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(__file__))
@@ -105,16 +106,41 @@ class EvalArgs:
 # Rolling state buffer — obs_horizon stacking
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _robot_state_from_env(env) -> np.ndarray:
+    """
+    Build the 16-D proprioceptive state from SAPIEN sim internals.
+
+    The live env flat obs is qpos(9)+qvel(9)=18 and has no eef_state, so we
+    bypass obs and read tcp.pose for forward-kinematics (same approach as
+    rollout_eval_binfill_fm.py).  Ordering matches training:
+      joint(7) + eef(6) + gripper(2) + is_gripper_close(1) = 16
+    """
+    base  = env.unwrapped
+    robot = base.agent.robot
+    tcp   = base.agent.tcp
+
+    qpos          = np.asarray(robot.qpos).astype(np.float32).ravel()
+    joint_state   = qpos[:7]                                                       # (7,)
+    gripper_state = qpos[7:9] if len(qpos) > 7 else np.zeros(2, np.float32)       # (2,)
+
+    p   = np.asarray(tcp.pose.p).astype(np.float32).ravel()[:3]                   # xyz
+    q   = np.asarray(tcp.pose.q).astype(np.float32).ravel()                       # wxyz
+    rpy = _Rotation.from_quat([q[1], q[2], q[3], q[0]]).as_euler("xyz").astype(np.float32)
+    eef_state = np.concatenate([p, rpy])                                           # (6,)
+
+    is_gripper_close = np.array([float(gripper_state.mean() < 0.02)], np.float32) # (1,)
+
+    return np.concatenate([joint_state, eef_state, gripper_state, is_gripper_close])  # (16,)
+
+
 class StateBuffer:
     """
     Maintains a rolling window of the last `obs_horizon` normalised state
     vectors so the policy receives velocity/history information.
 
-    On reset() the window is filled with the initial obs (start-of-subtask
-    padding, matching the training-time SubtaskDataset behaviour).
-    Each env.step() call should be followed by push(new_obs).
-    get_stacked() returns a (1, obs_horizon * STATE_DIM) tensor ready for
-    policy.sample().
+    reset(env) fills the window with the initial robot state (padding matches
+    training).  push(env) is called after every env.step().
+    get_stacked() returns a (1, obs_horizon * STATE_DIM) tensor.
     """
 
     def __init__(
@@ -129,28 +155,20 @@ class StateBuffer:
         self.device  = device
         self._buf: deque = deque(maxlen=obs_horizon)
 
-    def _extract_normalised(self, obs: Dict) -> np.ndarray:
-        # RoboMME live env returns list-based obs; [-1] gives the latest frame.
-        # is_gripper_close is not in obs — derive it from gripper width < 0.02 m.
-        joint_state   = np.asarray(obs["joint_state_list"][-1],   dtype=np.float32).ravel()[:7]   # (7,)
-        eef_state     = np.asarray(obs["eef_state_list"][-1],     dtype=np.float32).ravel()[:6]   # (6,)
-        gripper_state = np.asarray(obs["gripper_state_list"][-1], dtype=np.float32).ravel()[:2]   # (2,)
-        is_gripper_close = np.array(
-            [float(gripper_state.mean() < 0.02)], dtype=np.float32
-        )                                                                                           # (1,)
-        raw = np.concatenate([joint_state, eef_state, gripper_state, is_gripper_close])            # (16,)
+    def _extract_normalised(self, env) -> np.ndarray:
+        raw = _robot_state_from_env(env)
         return (raw - self._s_mean) / self._s_std
 
-    def reset(self, obs: Dict) -> None:
-        """Fill window with first obs (padding matches training)."""
-        first = self._extract_normalised(obs)
+    def reset(self, env) -> None:
+        """Fill window with initial robot state (padding matches training)."""
+        first = self._extract_normalised(env)
         self._buf.clear()
         for _ in range(self.obs_horizon):
             self._buf.append(first.copy())
 
-    def push(self, obs: Dict) -> None:
-        """Append new obs; oldest is automatically evicted (maxlen deque)."""
-        self._buf.append(self._extract_normalised(obs))
+    def push(self, env) -> None:
+        """Append current robot state; oldest is automatically evicted."""
+        self._buf.append(self._extract_normalised(env))
 
     def get_stacked(self) -> torch.Tensor:
         """Return (1, obs_horizon * STATE_DIM) float32 tensor."""
@@ -246,22 +264,9 @@ def run_episode(
     """
     obs, info = env.reset()
 
-    # Debug: print obs structure + values once on the first episode
-    if not hasattr(run_episode, "_obs_printed"):
-        run_episode._obs_printed = True
-        if hasattr(obs, "shape"):
-            vals = obs[0].cpu().tolist()
-            print(f"[DEBUG] obs type=tensor  shape={obs.shape}  dtype={obs.dtype}")
-            for i, v in enumerate(vals):
-                print(f"  obs[0,{i:2d}] = {v: .6f}")
-        elif hasattr(obs, "keys"):
-            print(f"[DEBUG] obs type=dict  keys={list(obs.keys())}")
-        else:
-            print(f"[DEBUG] obs type={type(obs)}")
-
-    # Initialise rolling state buffer (padded with first obs)
+    # Initialise rolling state buffer (reads SAPIEN robot state, not flat obs tensor)
     state_buf = StateBuffer(obs_horizon, policy, device)
-    state_buf.reset(obs)
+    state_buf.reset(env)
 
     # Initialise TODO queue from the very first subgoal
     initial_sg = _decode_info_str(info.get("grounded_subgoal_online", "pick up the object"))
@@ -293,8 +298,8 @@ def run_episode(
         obs, _reward, terminated, truncated, info = env.step(step_action)
         ep_steps += 1
 
-        # Push new obs into rolling buffer for next step
-        state_buf.push(obs)
+        # Update rolling buffer from SAPIEN state after the step
+        state_buf.push(env)
 
         # ── Check for subgoal boundary ────────────────────────────────────
         is_boundary = info.get("is_subgoal_boundary", False)
