@@ -70,8 +70,12 @@ from bc_subtask_train import (
 
 @dataclass
 class EvalArgs:
-    checkpoint: str
-    """Path to .pt file saved by bc_subtask_train.py  (required)"""
+    checkpoint: Optional[str] = None
+    """Path to .pt file saved by bc_subtask_train.py (required for policy eval,
+    optional when --replay_h5 True)"""
+    replay_h5: bool = False
+    """If True, replay stored H5 joint_angle actions in sim (sanity check that
+    H5 data achieves success). Requires --h5_file. No policy is needed."""
 
     # Environment
     dataset:           str           = "val"
@@ -296,6 +300,56 @@ def _build_env_builder_from_h5(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# H5 action replay — sanity check / oracle baseline
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_h5_replay_episode(env, h5_file: str, h5_episode_idx: int) -> Dict:
+    """
+    Replay stored H5 joint_angle actions for one episode in the sim.
+
+    env must be created via BenchmarkEnvBuilder.make_env_for_episode() with the
+    seed/difficulty that matches this episode in the H5 file.
+    h5_episode_idx is the original episode number in the H5 file (N in 'episode_N').
+
+    Uses EpisodeDatasetResolver from robomme to load per-timestep joint_action
+    arrays, skipping video-demo steps exactly as during data collection.
+    """
+    from robomme.env_record_wrapper.episode_dataset_resolver import EpisodeDatasetResolver
+
+    resolver   = EpisodeDatasetResolver("BinFill", h5_episode_idx, h5_file)
+    n_h5_steps = len(resolver._non_demo_steps)
+
+    obs, info  = env.reset()
+    status     = "ongoing"
+    ep_steps   = 0
+
+    for step_id in range(n_h5_steps):
+        action = resolver.get_step("joint_angle", step_id)
+        if action is None:
+            break
+
+        obs, _reward, terminated, truncated, info = env.step(action)
+        ep_steps += 1
+
+        if isinstance(terminated, torch.Tensor):
+            terminated = bool(terminated.any().item())
+        if isinstance(truncated, torch.Tensor):
+            truncated = bool(truncated.any().item())
+
+        status = _decode_info_str(info.get("status", "ongoing"))
+        if terminated or truncated or status in ("success", "fail", "timeout", "error"):
+            break
+
+    resolver.close()
+    return {
+        "episode_success": (status == "success"),
+        "steps":           ep_steps,
+        "final_status":    status,
+        "n_h5_actions":    n_h5_steps,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Single-episode runner
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -451,10 +505,77 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
     print(f"Device          : {device}")
-    print(f"Checkpoint      : {args.checkpoint}")
     print(f"Dataset         : {args.h5_file if args.h5_file else args.dataset}")
     print(f"Eval episodes   : {args.num_eval_episodes}")
     print(f"Max ep steps    : {args.max_episode_steps}")
+
+    # ── H5 replay mode ────────────────────────────────────────────────────────
+    if args.replay_h5:
+        if args.h5_file is None:
+            print("[ERROR] --h5_file is required for --replay_h5 True")
+            sys.exit(1)
+
+        print(f"Mode            : H5 replay (stored actions, no policy)")
+        print(f"H5 file         : {args.h5_file}")
+
+        from robomme.env_record_wrapper.episode_config_resolver import BenchmarkEnvBuilder
+
+        # Load original episode indices (N in 'episode_N') to pass to EpisodeDatasetResolver.
+        # _build_env_builder_from_h5 uses the same load order, so seq_idx i → h5_ep_indices[i].
+        _, episode_setups = load_subtasks_from_h5(args.h5_file, args.num_eval_episodes)
+        h5_ep_indices     = [int(s["episode_key"].split("_")[1]) for s in episode_setups]
+
+        env_builder = _build_env_builder_from_h5(args.h5_file, args.num_eval_episodes)
+        n_available = env_builder.get_episode_num()
+        n_to_eval   = min(args.num_eval_episodes, n_available)
+
+        print(f"H5 episodes     : {n_available} available")
+        print(f"Replaying       : {n_to_eval} episodes\n")
+
+        col = f"{'Ep':>4}  {'H5Ep':>5}  {'Steps':>5}  {'H5Acts':>7}  {'Status':>9}"
+        print(col)
+        print("-" * 40)
+
+        replay_results: List[Dict] = []
+        for seq_idx in range(n_to_eval):
+            h5_ep_idx = h5_ep_indices[seq_idx]
+            _env = env_builder.make_env_for_episode(seq_idx)
+            r = run_h5_replay_episode(_env, args.h5_file, h5_ep_idx)
+            _env.close()
+            replay_results.append(r)
+            print(
+                f"{seq_idx:>4d}"
+                f"  {h5_ep_idx:>5d}"
+                f"  {r['steps']:>5d}"
+                f"  {r['n_h5_actions']:>7d}"
+                f"  {'SUCCESS' if r['episode_success'] else r['final_status']:>9}"
+            )
+
+        n_ep         = len(replay_results)
+        success_rate = float(np.mean([r["episode_success"] for r in replay_results]))
+        mean_steps   = float(np.mean([r["steps"]           for r in replay_results]))
+        status_counts = Counter(r["final_status"] for r in replay_results)
+
+        print("\n" + "=" * 55)
+        print("H5 REPLAY SUMMARY")
+        print("=" * 55)
+        print(f"  Episodes evaluated  : {n_ep}")
+        print(f"  Success rate        : {success_rate:.3f}"
+              f"  ({int(success_rate * n_ep)}/{n_ep})")
+        print(f"  Mean episode steps  : {mean_steps:.1f}")
+        print(f"\n  Status breakdown:")
+        for st, count in sorted(status_counts.items(), key=lambda x: -x[1]):
+            print(f"    {st:<12}: {count:>4}  ({count/n_ep:.1%})")
+        print("=" * 55)
+        sys.exit(0)
+
+    # ── Policy eval mode ──────────────────────────────────────────────────────
+    if args.checkpoint is None:
+        print("[ERROR] --checkpoint is required for policy eval. "
+              "Use --replay_h5 True to run H5 action replay instead.")
+        sys.exit(1)
+
+    print(f"Checkpoint      : {args.checkpoint}")
     print(f"ODE steps       : {args.n_inference_steps}")
 
     # ── Load checkpoint ───────────────────────────────────────────────────
@@ -483,7 +604,7 @@ if __name__ == "__main__":
     print(f"Action mean     : {policy.action_mean.cpu().numpy()}")
     print(f"Action std      : {policy.action_std.cpu().numpy()}")
 
-    # ── Benchmark simulation evaluation ──────────────────────────────────
+    # ── Build env builder ─────────────────────────────────────────────────
     # If --h5_file is given, episode seeds/difficulties are taken directly from
     # the H5 recording so scenes exactly match training data.
     # Otherwise, BenchmarkEnvBuilder's built-in split metadata is used.
@@ -554,7 +675,7 @@ if __name__ == "__main__":
     subtask_completion_rate = mean_subtasks_done / max(expected, 1)
 
     print("\n" + "=" * 64)
-    print(f"EVAL SUMMARY  [{args.dataset}]")
+    print(f"EVAL SUMMARY  [{args.dataset if args.h5_file is None else 'H5'}]")
     print("=" * 64)
     print(f"  Episodes evaluated         : {n_ep}")
     print(f"  Episode success rate       : {success_rate:.3f}"
