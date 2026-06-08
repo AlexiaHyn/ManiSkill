@@ -126,7 +126,7 @@ def parse_grounded_subgoal(text: str) -> Dict:
             color = i
             break
 
-    m = re.search(r"\[(\d+),\s*(\d+)\]", t)
+    m = re.search(r"[\[<](\d+),\s*(\d+)[\]>]", t)
     if m:
         pixel_y = float(m.group(1)) / IMG_SIZE
         pixel_x = float(m.group(2)) / IMG_SIZE

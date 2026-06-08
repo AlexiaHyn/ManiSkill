@@ -296,6 +296,23 @@ def run_episode(
     if initial_raw_state is not None:
         # Use H5-recorded state so initial input matches training exactly
         state_buf.reset_from_h5(initial_raw_state)
+
+        # One-time consistency check: compare H5 state vs live SAPIEN state
+        if not hasattr(run_episode, "_state_checked"):
+            run_episode._state_checked = True
+            live_state = _robot_state_from_env(env)
+            labels = (
+                [f"joint[{i}]" for i in range(7)] +
+                [f"eef[{i}]"   for i in range(6)] +
+                [f"grip[{i}]"  for i in range(2)] +
+                ["is_grip_close"]
+            )
+            print("\n[STATE CHECK] H5 state[0] vs live SAPIEN at env.reset():")
+            print(f"  {'field':<16}  {'H5':>10}  {'live':>10}  {'diff':>10}")
+            print(f"  {'-'*50}")
+            for lbl, h5v, lv in zip(labels, initial_raw_state, live_state):
+                print(f"  {lbl:<16}  {h5v:>10.5f}  {lv:>10.5f}  {abs(h5v-lv):>10.5f}")
+            print()
     else:
         state_buf.reset(env)
 
@@ -345,6 +362,20 @@ def run_episode(
             # The subtask that was just running is complete.
             # grounded_subgoal_online already holds the NEW subgoal.
             new_sg = _decode_info_str(info.get("grounded_subgoal_online", queue.current_text))
+
+            # One-time log to verify the live env's subgoal format contains
+            # pixel coordinates that the parser can extract
+            if not hasattr(run_episode, "_subgoal_logged"):
+                run_episode._subgoal_logged = True
+                parsed = parse_grounded_subgoal(new_sg)
+                print(f"[SUBGOAL CHECK] live env text : '{new_sg}'")
+                print(f"[SUBGOAL CHECK] parsed        : action_type={parsed['action_type']}"
+                      f"  color={parsed['color']}"
+                      f"  pixel=({parsed['pixel_y']:.4f}, {parsed['pixel_x']:.4f})")
+                if parsed["pixel_y"] == 0.0 and parsed["pixel_x"] == 0.0:
+                    print("[SUBGOAL CHECK] WARNING: pixel coords are (0,0) — "
+                          "subgoal text may be missing coordinates")
+
             if new_sg != queue.current_text:
                 queue.advance(new_sg)
             else:
