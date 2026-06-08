@@ -53,7 +53,6 @@ import re
 import numpy as np
 import torch
 import tyro
-from scipy.spatial.transform import Rotation as _Rotation
 
 # ── imports from training module ──────────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(__file__))
@@ -97,11 +96,6 @@ class EvalArgs:
     seed: int  = 42
     cuda: bool = True
 
-    # Action format passed to env.step()
-    # "array"  → numpy array of shape (8,) — most common
-    # "dict"   → {"joint_action": array}   — if env expects a dict
-    action_format: str = "array"
-
     # Offline H5 evaluation (optional — set to skip live-sim eval and/or add offline)
     h5_file:         Optional[str] = None
     """If set, also run sim evaluation on H5 episodes (both train and val splits)"""
@@ -119,31 +113,21 @@ class EvalArgs:
 # Rolling state buffer — obs_horizon stacking
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _robot_state_from_env(env) -> np.ndarray:
+def _robot_state_from_obs(obs: dict) -> np.ndarray:
     """
-    Build the 16-D proprioceptive state from SAPIEN sim internals.
+    Build the 16-D proprioceptive state from a DemonstrationWrapper obs dict.
 
-    The live env flat obs is qpos(9)+qvel(9)=18 and has no eef_state, so we
-    bypass obs and read tcp.pose for forward-kinematics (same approach as
-    rollout_eval_binfill_fm.py).  Ordering matches training:
+    DemonstrationWrapper computes eef_state via build_endeffector_pose_dict
+    (sign-aligned quaternion + unwrapped continuous RPY), exactly matching the
+    pipeline used during H5 data recording.  Ordering matches training:
       joint(7) + eef(6) + gripper(2) + is_gripper_close(1) = 16
     """
-    base  = env.unwrapped
-    robot = base.agent.robot
-    tcp   = base.agent.tcp
-
-    qpos          = np.asarray(robot.qpos).astype(np.float32).ravel()
-    joint_state   = qpos[:7]                                                       # (7,)
-    gripper_state = qpos[7:9] if len(qpos) > 7 else np.zeros(2, np.float32)       # (2,)
-
-    p   = np.asarray(tcp.pose.p).astype(np.float32).ravel()[:3]                   # xyz
-    q   = np.asarray(tcp.pose.q).astype(np.float32).ravel()                       # wxyz
-    rpy = _Rotation.from_quat([q[1], q[2], q[3], q[0]]).as_euler("xyz").astype(np.float32)
-    eef_state = np.concatenate([p, rpy])                                           # (6,)
-
-    is_gripper_close = np.array([float(gripper_state.mean() < 0.02)], np.float32) # (1,)
-
-    return np.concatenate([joint_state, eef_state, gripper_state, is_gripper_close])  # (16,)
+    joint   = np.asarray(obs["joint_state_list"][-1],   np.float32).ravel()[:7]   # (7,)
+    eef     = np.asarray(obs["eef_state_list"][-1],     np.float32).ravel()[:6]   # (6,)
+    gripper = np.asarray(obs["gripper_state_list"][-1], np.float32).ravel()[:2]   # (2,)
+    # Use same threshold as RecordWrapper: closed if ANY joint < 0.03
+    is_gc   = np.array([float(np.any(gripper < 0.03))], np.float32)               # (1,)
+    return np.concatenate([joint, eef, gripper, is_gc])                            # (16,)
 
 
 class StateBuffer:
@@ -151,9 +135,11 @@ class StateBuffer:
     Maintains a rolling window of the last `obs_horizon` normalised state
     vectors so the policy receives velocity/history information.
 
-    reset(env) fills the window with the initial robot state (padding matches
-    training).  push(env) is called after every env.step().
+    reset(obs) fills the window with the initial robot state (padding matches
+    training).  push(obs) is called after every env.step() when obs is not None.
     get_stacked() returns a (1, obs_horizon * STATE_DIM) tensor.
+
+    obs must be the dict[str, list] returned by DemonstrationWrapper / FailAwareWrapper.
     """
 
     def __init__(
@@ -168,13 +154,13 @@ class StateBuffer:
         self.device  = device
         self._buf: deque = deque(maxlen=obs_horizon)
 
-    def _extract_normalised(self, env) -> np.ndarray:
-        raw = _robot_state_from_env(env)
+    def _extract_normalised(self, obs: dict) -> np.ndarray:
+        raw = _robot_state_from_obs(obs)
         return (raw - self._s_mean) / self._s_std
 
-    def reset(self, env) -> None:
-        """Fill window with initial robot state (padding matches training)."""
-        first = self._extract_normalised(env)
+    def reset(self, obs: dict) -> None:
+        """Fill window with initial robot state from a DemonstrationWrapper obs."""
+        first = self._extract_normalised(obs)
         self._buf.clear()
         for _ in range(self.obs_horizon):
             self._buf.append(first.copy())
@@ -187,9 +173,11 @@ class StateBuffer:
         for _ in range(self.obs_horizon):
             self._buf.append(normalised.copy())
 
-    def push(self, env) -> None:
-        """Append current robot state; oldest is automatically evicted."""
-        self._buf.append(self._extract_normalised(env))
+    def push(self, obs: Optional[dict]) -> None:
+        """Append current robot state; no-op if obs is None (FailAwareWrapper error)."""
+        if obs is None:
+            return
+        self._buf.append(self._extract_normalised(obs))
 
     def get_stacked(self) -> torch.Tensor:
         """Return (1, obs_horizon * STATE_DIM) float32 tensor."""
@@ -206,91 +194,6 @@ def _decode_info_str(val) -> str:
         return item.decode("utf-8") if isinstance(item, bytes) else str(item)
     return str(val) if val is not None else ""
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Camera utilities — pixel coordinate computation for BinFill
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _binfill_camera_params():
-    """
-    Compute intrinsic K and extrinsic E for BinFill's fixed front camera.
-    Config (from BinFill._default_sensor_configs):
-      eye=[0.3, 0, 0.4], target=[0, 0, -0.2], fov=pi/2, 256×256.
-    Returns (K [3x3 float64], E [3x4 float64]) in OpenCV convention.
-    """
-    eye    = np.array([0.3, 0.0,  0.4])
-    target = np.array([0.0, 0.0, -0.2])
-    up     = np.array([0.0, 0.0,  1.0])
-
-    z_c = target - eye;  z_c /= np.linalg.norm(z_c)      # forward (into scene)
-    # SAPIEN look_at uses left=cross(up,z), then OpenCV converts right=-left=cross(z,up)
-    x_c = np.cross(z_c, up);  x_c /= np.linalg.norm(x_c)  # right in OpenCV image
-    y_c = np.cross(z_c, x_c)                                # down in OpenCV image
-
-    R = np.stack([x_c, y_c, z_c], axis=0)
-    t = -R @ eye
-    E = np.hstack([R, t.reshape(-1, 1)]).astype(np.float64)
-
-    f = 128.0  # = 256 / (2 * tan(pi/4))
-    K = np.array([[f, 0.0, 128.0],
-                  [0.0, f, 128.0],
-                  [0.0, 0.0,  1.0]], dtype=np.float64)
-    return K, E
-
-
-def _grounded_subgoal_from_env(env, cam_K: np.ndarray, cam_E: np.ndarray) -> str:
-    """
-    Build a grounded_subgoal_online string for the env's CURRENT task by:
-      1. Reading task_list[timestep] for the task name, template, and target segment.
-      2. Projecting the first target object's 3-D position to 2-D pixel coords.
-      3. Filling the '<>' placeholder in the template with '<row, col>'.
-
-    Falls back to the task name (without pixel coords) if projection fails.
-    This is needed because raw BinFill (no DemonstrationWrapper) never sets
-    info['grounded_subgoal_online'], so we compute it ourselves.
-    """
-    try:
-        from robomme.robomme_env.utils.choice_action_mapping import (
-            project_world_to_pixel as _pwp,
-            extract_actor_position_xyz as _eap,
-        )
-    except ImportError:
-        _pwp = _eap = None
-
-    base      = env.unwrapped
-    task_list = getattr(base, "task_list", [])
-    task_idx  = int(getattr(base, "timestep", 0))
-
-    if not task_list or task_idx >= len(task_list):
-        return getattr(base, "current_task_name_online", "") or ""
-
-    task     = task_list[task_idx]
-    name     = task.get("name", "Unknown")
-    template = task.get("subgoal_segment", name) or name
-    segment  = task.get("segment", None)
-
-    if _pwp is None or segment is None:
-        return name
-
-    candidates = segment if isinstance(segment, (list, tuple)) else [segment]
-
-    for obj in candidates:
-        try:
-            world_pos = _eap(obj) if _eap else None
-        except Exception:
-            world_pos = None
-        if world_pos is None:
-            continue
-        try:
-            result = _pwp(world_pos, cam_K, cam_E, (256, 256))
-        except Exception:
-            result = None
-        if result is not None:
-            col, row = int(result[0]), int(result[1])  # [pixel_x, pixel_y]
-            filled = re.sub(r"<[^>]*>", f"<{row}, {col}>", template, count=1)
-            return filled
-
-    return name
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -354,7 +257,6 @@ def run_episode(
     device:               torch.device,
     n_steps:              int,
     max_steps:            int,
-    action_format:        str,
     obs_horizon:          int,
     initial_subgoal_text: Optional[str]       = None,
     initial_raw_state:    Optional[np.ndarray] = None,
@@ -377,45 +279,44 @@ def run_episode(
     """
     obs, info = env.reset()
 
-    # Camera params for pixel coordinate computation (fixed in BinFill)
-    _cam_K, _cam_E = _binfill_camera_params()
     # Track env.unwrapped.timestep for task boundary detection.
-    # Raw BinFill (no DemonstrationWrapper) does NOT set info['is_subgoal_boundary'];
-    # sequential_task_check increments env.unwrapped.timestep when a task completes.
+    # DemonstrationWrapper sets allow_subgoal_change_this_timestep=True, so
+    # grounded_subgoal_online updates in the same step that a task completes.
+    # We use env.unwrapped.timestep as the trigger and read the new subgoal from info.
     _prev_task_idx = int(getattr(env.unwrapped, "timestep", 0))
 
     # Initialise rolling state buffer
     state_buf = StateBuffer(obs_horizon, policy, device)
     if initial_raw_state is not None:
-        # Use H5-recorded state so initial input matches training exactly
+        # Use H5-recorded state so the policy's initial input exactly matches training.
         state_buf.reset_from_h5(initial_raw_state)
 
-        # One-time consistency check: compare H5 state vs live SAPIEN state
+        # One-time consistency check: compare H5 state vs DemonstrationWrapper obs.
         if not hasattr(run_episode, "_state_checked"):
             run_episode._state_checked = True
-            live_state = _robot_state_from_env(env)
+            live_state = _robot_state_from_obs(obs)
             labels = (
                 [f"joint[{i}]" for i in range(7)] +
                 [f"eef[{i}]"   for i in range(6)] +
                 [f"grip[{i}]"  for i in range(2)] +
                 ["is_grip_close"]
             )
-            print("\n[STATE CHECK] H5 state[0] vs live SAPIEN at env.reset():")
+            print("\n[STATE CHECK] H5 state[0] vs DemonstrationWrapper obs at reset():")
             print(f"  {'field':<16}  {'H5':>10}  {'live':>10}  {'diff':>10}")
             print(f"  {'-'*50}")
             for lbl, h5v, lv in zip(labels, initial_raw_state, live_state):
                 print(f"  {lbl:<16}  {h5v:>10.5f}  {lv:>10.5f}  {abs(h5v-lv):>10.5f}")
             print()
     else:
-        state_buf.reset(env)
+        state_buf.reset(obs)
 
     # Initialise TODO queue.
-    # H5 sim eval: use H5 subgoal text (exact pixel coords from data collection).
-    # Random sim eval: compute from env's first task + 3-D projection.
+    # H5 sim eval: use the H5 subgoal text (exact pixel coords from data collection).
+    # Live sim eval: read grounded_subgoal_online directly from DemonstrationWrapper info.
     if initial_subgoal_text is not None:
         initial_sg = initial_subgoal_text
     else:
-        initial_sg = _grounded_subgoal_from_env(env, _cam_K, _cam_E)
+        initial_sg = _decode_info_str(info.get("grounded_subgoal_online", ""))
         if not initial_sg:
             initial_sg = "pick up the object"
     queue = SubtaskQueue(initial_sg)
@@ -437,69 +338,48 @@ def run_episode(
         action_np = action_tensor.squeeze(0).cpu().numpy()   # (8,)
 
         # ── Step environment ──────────────────────────────────────────────
-        if action_format == "dict":
-            step_action = {"joint_action": action_np}
-        else:
-            step_action = action_np
-
-        obs, _reward, terminated, truncated, info = env.step(step_action)
+        obs, _reward, terminated, truncated, info = env.step(action_np)
         ep_steps += 1
-        # ManiSkill raw env returns torch tensors; normalise to bool
+        # DemonstrationWrapper returns scalar bool tensors; normalise to Python bool.
         if isinstance(terminated, torch.Tensor):
             terminated = bool(terminated.any().item())
         if isinstance(truncated, torch.Tensor):
             truncated = bool(truncated.any().item())
 
-        # Update rolling buffer from SAPIEN state after the step
-        state_buf.push(env)
+        # Update rolling buffer (obs is None on FailAwareWrapper error; push is a no-op).
+        state_buf.push(obs)
 
         # ── Check for subgoal boundary ────────────────────────────────────
-        # Raw BinFill never sets info['is_subgoal_boundary'].  We detect
-        # task transitions by watching env.unwrapped.timestep, which
-        # sequential_task_check increments when the current task's func()
-        # returns True (regardless of allow_subgoal_change_this_timestep).
         cur_task_idx = int(getattr(env.unwrapped, "timestep", 0))
         is_boundary  = (cur_task_idx != _prev_task_idx)
         _prev_task_idx = cur_task_idx
 
         if is_boundary:
-            # Task completed; read the NEW task directly from task_list[timestep]
-            # so we don't need to wait for current_task_name_online to refresh.
-            new_sg = _grounded_subgoal_from_env(env, _cam_K, _cam_E)
+            new_sg = _decode_info_str(info.get("grounded_subgoal_online", ""))
 
-            # One-time log to verify pixel coordinate computation
+            # One-time diagnostic log
             if not hasattr(run_episode, "_subgoal_logged"):
                 run_episode._subgoal_logged = True
                 parsed = parse_grounded_subgoal(new_sg)
-                print(f"[SUBGOAL CHECK] boundary task → '{new_sg}'")
+                print(f"[SUBGOAL CHECK] boundary → '{new_sg}'")
                 print(f"[SUBGOAL CHECK] parsed : action_type={parsed['action_type']}"
                       f"  color={parsed['color']}"
                       f"  pixel=({parsed['pixel_y']:.4f}, {parsed['pixel_x']:.4f})")
 
+            # Advance only when a NEW distinct subgoal appears.
+            # When the last task completes, grounded_subgoal_online stays the same
+            # text, so new_sg == queue.current_text → we skip here.
+            # The final subtask is counted via episode_success below.
             if new_sg and new_sg != queue.current_text:
                 queue.advance(new_sg)
-            # If new_sg is "" (last task just ended) or matches the current text,
-            # do NOT count here.  The final subtask is counted via episode_success
-            # in: subtasks_completed = queue.completed + (1 if episode_success else 0)
 
         # ── Check episode termination ─────────────────────────────────────
-        # DemonstrationWrapper sets info["status"]; raw BinFill does not.
-        # For raw BinFill we read info["success"] / info["fail"] tensors directly.
+        # DemonstrationWrapper always sets info["status"] to one of:
+        #   "success" | "fail" | "timeout" | "ongoing" | "error"
         status = _decode_info_str(info.get("status", "ongoing"))
-        _raw_success = info.get("success", False)
-        if isinstance(_raw_success, torch.Tensor):
-            _raw_success = bool(_raw_success.item())
-        _raw_fail = info.get("fail", False)
-        if isinstance(_raw_fail, torch.Tensor):
-            _raw_fail = bool(_raw_fail.item())
-
-        if status == "ongoing" and _raw_success:
-            status = "success"
-        elif status == "ongoing" and _raw_fail:
-            status = "fail"
 
         if terminated or truncated or status in ("success", "fail", "timeout", "error"):
-            episode_success = (status == "success") or bool(_raw_success)
+            episode_success = (status == "success")
             break
 
     # The final subtask has no subsequent boundary transition (the episode ends
@@ -566,8 +446,22 @@ if __name__ == "__main__":
     if not args.skip_sim_eval:
         try:
             from robomme.robomme_env.BinFill import BinFill
-            env = BinFill(difficulty=args.env_difficulty, seed=args.seed)
-            print(f"\nEnvironment     : BinFill  (difficulty={args.env_difficulty})\n")
+            from robomme.env_record_wrapper.DemonstrationWrapper import DemonstrationWrapper
+            from robomme.env_record_wrapper.FailAwareWrapper import FailAwareWrapper
+            _base = BinFill(
+                difficulty   = args.env_difficulty,
+                seed         = args.seed,
+                obs_mode     = "rgb+depth+segmentation",
+                control_mode = "pd_joint_pos",
+                reward_mode  = "dense",
+                render_mode  = "rgb_array",
+            )
+            env = FailAwareWrapper(DemonstrationWrapper(
+                _base,
+                max_steps_without_demonstration = args.max_episode_steps + 2,
+                gui_render = False,
+            ))
+            print(f"\nEnvironment     : BinFill+DemonstrationWrapper  (difficulty={args.env_difficulty})\n")
         except ImportError as exc:
             print(f"\n[ERROR] Cannot import RoboMME BinFill: {exc}")
             print("  Ensure the robomme package is installed:")
@@ -582,13 +476,12 @@ if __name__ == "__main__":
         results: List[Dict] = []
         for ep_idx in range(args.num_eval_episodes):
             r = run_episode(
-                env           = env,
-                policy        = policy,
-                device        = device,
-                n_steps       = args.n_inference_steps,
-                max_steps     = args.max_episode_steps,
-                action_format = args.action_format,
-                obs_horizon   = obs_horizon,
+                env         = env,
+                policy      = policy,
+                device      = device,
+                n_steps     = args.n_inference_steps,
+                max_steps   = args.max_episode_steps,
+                obs_horizon = obs_horizon,
             )
             results.append(r)
             print(
@@ -645,6 +538,8 @@ if __name__ == "__main__":
     if args.h5_file is not None:
         try:
             from robomme.robomme_env.BinFill import BinFill as _BinFill
+            from robomme.env_record_wrapper.DemonstrationWrapper import DemonstrationWrapper as _DW
+            from robomme.env_record_wrapper.FailAwareWrapper import FailAwareWrapper as _FAW
         except ImportError as exc:
             print(f"\n[ERROR] Cannot import RoboMME BinFill for H5 sim eval: {exc}")
             raise
@@ -684,14 +579,25 @@ if __name__ == "__main__":
                 h5_first_state   = ep_subtasks[0]["states"][0]   if ep_subtasks else None
                 h5_first_subgoal = ep_subtasks[0]["subgoal_text"] if ep_subtasks else None
 
-                h5_env = _BinFill(difficulty=setup["difficulty"], seed=setup["seed"])
+                _h5_base = _BinFill(
+                    difficulty   = setup["difficulty"],
+                    seed         = setup["seed"],
+                    obs_mode     = "rgb+depth+segmentation",
+                    control_mode = "pd_joint_pos",
+                    reward_mode  = "dense",
+                    render_mode  = "rgb_array",
+                )
+                h5_env = _FAW(_DW(
+                    _h5_base,
+                    max_steps_without_demonstration = args.max_episode_steps + 2,
+                    gui_render = False,
+                ))
                 r = run_episode(
                     env                  = h5_env,
                     policy               = policy,
                     device               = device,
                     n_steps              = args.n_inference_steps,
                     max_steps            = args.max_episode_steps,
-                    action_format        = args.action_format,
                     obs_horizon          = obs_horizon,
                     initial_subgoal_text = h5_first_subgoal,
                     initial_raw_state    = h5_first_state,
