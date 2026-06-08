@@ -285,7 +285,6 @@ def run_episode(
         action_tensor = policy.sample(
             state_tensor, action_type, color, pixel,
             n_steps=n_steps,
-            state_is_raw=False,   # already normalised inside StateBuffer
         )
         action_np = action_tensor.squeeze(0).cpu().numpy()   # (8,)
 
