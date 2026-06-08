@@ -45,7 +45,7 @@ for convenience).
 import os
 import sys
 import random
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -82,13 +82,13 @@ class EvalArgs:
     """For subtask_completion_rate. If None, estimated from mean of completed episodes."""
 
     # Policy inference
-    n_inference_steps: int = 10
+    n_inference_steps: int = 20
     """Euler ODE steps (more → smoother action, slower per step)"""
 
     # Model arch — must match the training run
     embed_dim:    int = 16
-    context_dim:  int = 256
-    hidden_dim:   int = 256
+    context_dim:  int = 512
+    hidden_dim:   int = 512
     time_emb_dim: int = 64
 
     seed: int  = 42
@@ -101,34 +101,58 @@ class EvalArgs:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Observation → normalised state tensor
+# Rolling state buffer — obs_horizon stacking
 # ─────────────────────────────────────────────────────────────────────────────
 
-def obs_to_state_tensor(
-    obs:    Dict,
-    policy: SubtaskFlowMatchingPolicy,
-    device: torch.device,
-) -> torch.Tensor:
+class StateBuffer:
     """
-    Extract robot proprioception from a live-env obs dict and return a
-    normalised (1, 16) float32 tensor.
+    Maintains a rolling window of the last `obs_horizon` normalised state
+    vectors so the policy receives velocity/history information.
 
-    The RoboMME env observation dict has the same keys as the H5 obs/ group:
-      joint_state       (7,)   absolute joint positions
-      eef_state         (6,)   [x, y, z, roll, pitch, yaw]
-      gripper_state     (2,)   opening width in [0, 0.04]
-      is_gripper_close  bool   whether gripper is closed
+    On reset() the window is filled with the initial obs (start-of-subtask
+    padding, matching the training-time SubtaskDataset behaviour).
+    Each env.step() call should be followed by push(new_obs).
+    get_stacked() returns a (1, obs_horizon * STATE_DIM) tensor ready for
+    policy.sample().
     """
-    joint_state      = np.asarray(obs["joint_state"],      dtype=np.float32).ravel()   # (7,)
-    eef_state        = np.asarray(obs["eef_state"],        dtype=np.float32).ravel()   # (6,)
-    gripper_state    = np.asarray(obs["gripper_state"],    dtype=np.float32).ravel()   # (2,)
-    is_gripper_close = np.array(
-        [float(bool(obs["is_gripper_close"]))], dtype=np.float32
-    )                                                                                    # (1,)
 
-    raw = np.concatenate([joint_state, eef_state, gripper_state, is_gripper_close])    # (16,)
-    normalised = (raw - policy.state_mean.cpu().numpy()) / policy.state_std.cpu().numpy()
-    return torch.from_numpy(normalised).float().unsqueeze(0).to(device)                # (1, 16)
+    def __init__(
+        self,
+        obs_horizon: int,
+        policy:      SubtaskFlowMatchingPolicy,
+        device:      torch.device,
+    ) -> None:
+        self.obs_horizon = obs_horizon
+        self._s_mean = policy.state_mean.cpu().numpy()
+        self._s_std  = policy.state_std.cpu().numpy()
+        self.device  = device
+        self._buf: deque = deque(maxlen=obs_horizon)
+
+    def _extract_normalised(self, obs: Dict) -> np.ndarray:
+        joint_state      = np.asarray(obs["joint_state"],      dtype=np.float32).ravel()  # (7,)
+        eef_state        = np.asarray(obs["eef_state"],        dtype=np.float32).ravel()  # (6,)
+        gripper_state    = np.asarray(obs["gripper_state"],    dtype=np.float32).ravel()  # (2,)
+        is_gripper_close = np.array(
+            [float(bool(obs["is_gripper_close"]))], dtype=np.float32
+        )                                                                                   # (1,)
+        raw = np.concatenate([joint_state, eef_state, gripper_state, is_gripper_close])   # (16,)
+        return (raw - self._s_mean) / self._s_std
+
+    def reset(self, obs: Dict) -> None:
+        """Fill window with first obs (padding matches training)."""
+        first = self._extract_normalised(obs)
+        self._buf.clear()
+        for _ in range(self.obs_horizon):
+            self._buf.append(first.copy())
+
+    def push(self, obs: Dict) -> None:
+        """Append new obs; oldest is automatically evicted (maxlen deque)."""
+        self._buf.append(self._extract_normalised(obs))
+
+    def get_stacked(self) -> torch.Tensor:
+        """Return (1, obs_horizon * STATE_DIM) float32 tensor."""
+        stacked = np.concatenate(list(self._buf), axis=0)
+        return torch.from_numpy(stacked).float().unsqueeze(0).to(self.device)
 
 
 def _decode_info_str(val) -> str:
@@ -198,11 +222,12 @@ class SubtaskQueue:
 @torch.no_grad()
 def run_episode(
     env,
-    policy:       SubtaskFlowMatchingPolicy,
-    device:       torch.device,
-    n_steps:      int,
-    max_steps:    int,
+    policy:        SubtaskFlowMatchingPolicy,
+    device:        torch.device,
+    n_steps:       int,
+    max_steps:     int,
     action_format: str,
+    obs_horizon:   int,
 ) -> Dict:
     """
     Execute one full episode driven by the subtask-queue policy.
@@ -218,6 +243,10 @@ def run_episode(
     """
     obs, info = env.reset()
 
+    # Initialise rolling state buffer (padded with first obs)
+    state_buf = StateBuffer(obs_horizon, policy, device)
+    state_buf.reset(obs)
+
     # Initialise TODO queue from the very first subgoal
     initial_sg = _decode_info_str(info.get("grounded_subgoal_online", "pick up the object"))
     queue      = SubtaskQueue(initial_sg)
@@ -228,22 +257,18 @@ def run_episode(
 
     for _ in range(max_steps):
         # ── Build policy inputs (all with batch dim=1) ────────────────────
-        state_tensor            = obs_to_state_tensor(obs, policy, device)
+        state_tensor              = state_buf.get_stacked()   # (1, obs_horizon * STATE_DIM)
         action_type, color, pixel = queue.subgoal_tensors(device)
 
         # ── Sample action via Euler ODE ───────────────────────────────────
         action_tensor = policy.sample(
             state_tensor, action_type, color, pixel,
             n_steps=n_steps,
-            state_is_raw=False,   # already normalised inside obs_to_state_tensor
+            state_is_raw=False,   # already normalised inside StateBuffer
         )
         action_np = action_tensor.squeeze(0).cpu().numpy()   # (8,)
 
         # ── Step environment ──────────────────────────────────────────────
-        # joint_action format: [j0 .. j6, gripper]
-        #   gripper: -1 = fully closed, +1 = fully open
-        # Adjust action_format to "dict" if env.step() expects a dict:
-        #   env.step({"joint_action": action_np})
         if action_format == "dict":
             step_action = {"joint_action": action_np}
         else:
@@ -251,6 +276,9 @@ def run_episode(
 
         obs, _reward, terminated, truncated, info = env.step(step_action)
         ep_steps += 1
+
+        # Push new obs into rolling buffer for next step
+        state_buf.push(obs)
 
         # ── Check for subgoal boundary ────────────────────────────────────
         is_boundary = info.get("is_subgoal_boundary", False)
@@ -309,21 +337,29 @@ if __name__ == "__main__":
     print(f"Max ep steps    : {args.max_episode_steps}")
     print(f"ODE steps       : {args.n_inference_steps}")
 
-    # ── Load policy ───────────────────────────────────────────────────────
+    # ── Load checkpoint ───────────────────────────────────────────────────
+    ckpt       = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    state_dict = ckpt["policy_state_dict"] if isinstance(ckpt, dict) and "policy_state_dict" in ckpt else ckpt
+
+    # Read obs_horizon from checkpoint buffers (backwards-compatible with old
+    # checkpoints that lacked obs_horizon_buf → fall back to 1)
+    obs_horizon = int(state_dict.get("obs_horizon_buf", torch.tensor(1)).item())
+    print(f"obs_horizon     : {obs_horizon}")
+
+    # ── Instantiate and load policy ───────────────────────────────────────
     policy = SubtaskFlowMatchingPolicy(
+        obs_horizon  = obs_horizon,
         embed_dim    = args.embed_dim,
         context_dim  = args.context_dim,
         hidden_dim   = args.hidden_dim,
         time_emb_dim = args.time_emb_dim,
     ).to(device)
 
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    state_dict = ckpt["policy_state_dict"] if "policy_state_dict" in ckpt else ckpt
     policy.load_state_dict(state_dict)
     policy.eval()
 
     n_params = sum(p.numel() for p in policy.parameters())
-    print(f"\nPolicy loaded   : {n_params:,} parameters")
+    print(f"Policy loaded   : {n_params:,} parameters")
     print(f"Action mean     : {policy.action_mean.cpu().numpy()}")
     print(f"Action std      : {policy.action_std.cpu().numpy()}")
 
@@ -361,6 +397,7 @@ if __name__ == "__main__":
             n_steps       = args.n_inference_steps,
             max_steps     = args.max_episode_steps,
             action_format = args.action_format,
+            obs_horizon   = obs_horizon,
         )
         results.append(r)
         print(

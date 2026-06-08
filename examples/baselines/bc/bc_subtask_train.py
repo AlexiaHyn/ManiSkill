@@ -52,6 +52,7 @@ Offline evaluation during training:
 Simulation evaluation is handled by eval_subtask_sim.py (separate script).
 """
 
+import copy
 import math
 import os
 import re
@@ -67,6 +68,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.optim.lr_scheduler import CosineAnnealingLR
 import tyro
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
@@ -296,56 +298,81 @@ def load_subtasks_from_h5(
 
 class SubtaskDataset(Dataset):
     """
-    Flat dataset of (state, action_type, color, pixel, action) per timestep.
+    Flat dataset of (stacked_state, action_type, color, pixel, action) per timestep.
 
-    States and actions are normalised using per-dim mean/std computed from the
-    training set. Pass fit_normalizer=True for training; pass the resulting
-    {state,action}_{mean,std} arrays to the validation set constructor.
+    obs_horizon > 1 stacks the last obs_horizon states into one vector of shape
+    (obs_horizon * STATE_DIM,).  At the start of each subtask, missing past frames
+    are filled by repeating the first frame (boundary padding).  This gives the
+    model velocity / direction information and is the single largest driver of
+    sim performance improvement.
 
-    The same subgoal fields repeat for every timestep within a segment.
+    States and actions are normalised using per-dim mean/std fitted on the training
+    set (same stats apply to every frame in the stack).
     """
 
     def __init__(
         self,
         subtask_list:   List[Dict],
+        obs_horizon:    int  = 1,
         state_mean:     Optional[np.ndarray] = None,
         state_std:      Optional[np.ndarray] = None,
         action_mean:    Optional[np.ndarray] = None,
         action_std:     Optional[np.ndarray] = None,
         fit_normalizer: bool = False,
     ):
-        all_states  = np.concatenate([s["states"]  for s in subtask_list], axis=0)
-        all_actions = np.concatenate([s["actions"] for s in subtask_list], axis=0)
+        self.obs_horizon = obs_horizon
+
+        # Fit normaliser stats on raw states / actions
+        all_states_raw  = np.concatenate([s["states"]  for s in subtask_list], axis=0)
+        all_actions_raw = np.concatenate([s["actions"] for s in subtask_list], axis=0)
 
         if fit_normalizer:
-            state_mean  = all_states.mean(0)
-            state_std   = all_states.std(0).clip(1e-6)
-            action_mean = all_actions.mean(0)
-            action_std  = all_actions.std(0).clip(1e-6)
+            state_mean  = all_states_raw.mean(0)
+            state_std   = all_states_raw.std(0).clip(1e-6)
+            action_mean = all_actions_raw.mean(0)
+            action_std  = all_actions_raw.std(0).clip(1e-6)
 
         self.state_mean  = state_mean
         self.state_std   = state_std
         self.action_mean = action_mean
         self.action_std  = action_std
 
-        if state_mean is not None:
-            all_states = (all_states - state_mean) / state_std
-        if action_mean is not None:
-            all_actions = (all_actions - action_mean) / action_std
+        # Build stacked obs and normalised actions across all subtasks
+        stacked_states: List[np.ndarray] = []
+        norm_actions:   List[np.ndarray] = []
+        action_types:   List[int]        = []
+        colors:         List[int]        = []
+        pixels:         List[List[float]]= []
 
-        # Broadcast per-segment subgoal to every timestep in the segment
-        action_types: List[int]            = []
-        colors:       List[int]            = []
-        pixels:       List[List[float]]    = []
         for st in subtask_list:
-            T  = len(st["states"])
-            sg = st["subgoal_parsed"]
+            T   = len(st["states"])
+            sg  = st["subgoal_parsed"]
+
+            # Normalise this subtask's states
+            s = st["states"]  # (T, 16)
+            if state_mean is not None:
+                s = (s - state_mean) / state_std
+
+            # Build obs stack for each timestep: pad start with first frame
+            for t in range(T):
+                frames = []
+                for h in range(obs_horizon):
+                    ti = t - (obs_horizon - 1 - h)   # oldest … newest
+                    frames.append(s[max(ti, 0)])       # clamp to first frame
+                stacked_states.append(np.concatenate(frames))  # (obs_horizon*16,)
+
+            # Normalise actions
+            a = st["actions"]  # (T, 8)
+            if action_mean is not None:
+                a = (a - action_mean) / action_std
+            norm_actions.append(a)
+
             action_types.extend([sg["action_type"]] * T)
             colors.extend([sg["color"]] * T)
             pixels.extend([[sg["pixel_y"], sg["pixel_x"]]] * T)
 
-        self.states       = torch.from_numpy(all_states).float()
-        self.actions      = torch.from_numpy(all_actions).float()
+        self.states       = torch.from_numpy(np.array(stacked_states, dtype=np.float32)).float()
+        self.actions      = torch.from_numpy(np.concatenate(norm_actions, axis=0)).float()
         self.action_types = torch.tensor(action_types, dtype=torch.long)
         self.colors       = torch.tensor(colors,       dtype=torch.long)
         self.pixels       = torch.tensor(pixels,       dtype=torch.float32)
@@ -396,19 +423,17 @@ def sinusoidal_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
 
 class SubtaskEncoder(nn.Module):
     """
-    Encodes (robot_state_16D, subgoal) into a fixed-size context vector.
+    Encodes (stacked_robot_state, subgoal) into a fixed-size context vector.
 
-    Subgoal is represented as:
-      - action_type ∈ {0,1,2}  → learned embedding
-      - color       ∈ {0,1,2,3}→ learned embedding
-      - pixel_y, pixel_x ∈ [0,1] → raw continuous
+    state input dim = obs_horizon * STATE_DIM (stacked frames give velocity signal).
+    Subgoal: action_type → embedding, color → embedding, pixel_y/x → raw float.
     """
 
-    def __init__(self, embed_dim: int, context_dim: int, hidden_dim: int):
+    def __init__(self, obs_horizon: int, embed_dim: int, context_dim: int, hidden_dim: int):
         super().__init__()
         self.action_type_emb = nn.Embedding(len(ACTION_TYPE_VOCAB), embed_dim)
         self.color_emb       = nn.Embedding(len(COLOR_VOCAB),       embed_dim)
-        in_dim = STATE_DIM + 2 * embed_dim + 2   # state + 2 embeddings + pixel(2)
+        in_dim = obs_horizon * STATE_DIM + 2 * embed_dim + 2
         self.net = nn.Sequential(
             nn.Linear(in_dim,    hidden_dim), nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim), nn.SiLU(),
@@ -417,7 +442,7 @@ class SubtaskEncoder(nn.Module):
 
     def forward(
         self,
-        state:       torch.Tensor,   # (B, 16)
+        state:       torch.Tensor,   # (B, obs_horizon * STATE_DIM)
         action_type: torch.Tensor,   # (B,)  long
         color:       torch.Tensor,   # (B,)  long
         pixel:       torch.Tensor,   # (B, 2)
@@ -468,17 +493,21 @@ class SubtaskFlowMatchingPolicy(nn.Module):
 
     def __init__(
         self,
+        obs_horizon:  int = 2,
         embed_dim:    int = 16,
-        context_dim:  int = 256,
-        hidden_dim:   int = 256,
+        context_dim:  int = 512,
+        hidden_dim:   int = 512,
         time_emb_dim: int = 64,
     ):
         super().__init__()
-        self.action_dim = ACTION_DIM
-        self.encoder    = SubtaskEncoder(embed_dim, context_dim, hidden_dim)
-        self.vf_net     = VectorFieldNet(ACTION_DIM, context_dim, time_emb_dim, hidden_dim)
+        self.action_dim  = ACTION_DIM
+        self.encoder     = SubtaskEncoder(obs_horizon, embed_dim, context_dim, hidden_dim)
+        self.vf_net      = VectorFieldNet(ACTION_DIM, context_dim, time_emb_dim, hidden_dim)
 
-        # Action normalisation parameters — set via set_normalizers() after data load
+        # obs_horizon stored as plain attribute (int) for easy access, AND as a
+        # buffer so it is serialised into the checkpoint state_dict.
+        self.obs_horizon = obs_horizon
+        self.register_buffer("obs_horizon_buf", torch.tensor(obs_horizon))
         self.register_buffer("state_mean",  torch.zeros(STATE_DIM))
         self.register_buffer("state_std",   torch.ones(STATE_DIM))
         self.register_buffer("action_mean", torch.zeros(ACTION_DIM))
@@ -486,26 +515,26 @@ class SubtaskFlowMatchingPolicy(nn.Module):
 
     def set_normalizers(
         self,
-        state_mean:  np.ndarray,
-        state_std:   np.ndarray,
-        action_mean: np.ndarray,
-        action_std:  np.ndarray,
+        s_mean:  np.ndarray,
+        s_std:   np.ndarray,
+        a_mean:  np.ndarray,
+        a_std:   np.ndarray,
     ) -> None:
-        self.state_mean.copy_(torch.from_numpy(state_mean.astype(np.float32)))
-        self.state_std.copy_(torch.from_numpy(state_std.astype(np.float32)))
-        self.action_mean.copy_(torch.from_numpy(action_mean.astype(np.float32)))
-        self.action_std.copy_(torch.from_numpy(action_std.astype(np.float32)))
+        self.state_mean.copy_(torch.from_numpy(s_mean.astype(np.float32)))
+        self.state_std.copy_(torch.from_numpy(s_std.astype(np.float32)))
+        self.action_mean.copy_(torch.from_numpy(a_mean.astype(np.float32)))
+        self.action_std.copy_(torch.from_numpy(a_std.astype(np.float32)))
 
     def _encode(self, state, action_type, color, pixel):
         return self.encoder(state, action_type, color, pixel)
 
     def compute_loss(
         self,
-        state:       torch.Tensor,   # (B, 16)  normalised
+        state:       torch.Tensor,   # (B, obs_horizon*STATE_DIM)  normalised
         action_type: torch.Tensor,   # (B,)
         color:       torch.Tensor,   # (B,)
         pixel:       torch.Tensor,   # (B, 2)
-        x_1:         torch.Tensor,   # (B, 8)   normalised ground-truth action
+        x_1:         torch.Tensor,   # (B, 8)  normalised ground-truth action
     ) -> torch.Tensor:
         """Conditional flow matching loss (OT-linear paths)."""
         B       = x_1.size(0)
@@ -523,24 +552,19 @@ class SubtaskFlowMatchingPolicy(nn.Module):
     @torch.no_grad()
     def sample(
         self,
-        state:       torch.Tensor,   # (B, 16) — normalised if from dataset, raw if from env
+        state:       torch.Tensor,   # (B, obs_horizon*STATE_DIM) — pre-normalised
         action_type: torch.Tensor,   # (B,)
         color:       torch.Tensor,   # (B,)
         pixel:       torch.Tensor,   # (B, 2)
-        n_steps:     int  = 10,
-        state_is_raw: bool = False,  # set True when feeding raw env obs (will normalise here)
+        n_steps:     int = 20,
     ) -> torch.Tensor:
         """Euler ODE integration → de-normalised joint_action (B, 8)."""
-        if state_is_raw:
-            state = (state - self.state_mean) / self.state_std
-
         context = self._encode(state, action_type, color, pixel)
         x = torch.randn(state.size(0), self.action_dim, device=state.device)
         dt = 1.0 / n_steps
         for k in range(n_steps):
             t = torch.full((state.size(0),), k * dt, device=state.device)
             x = x + self.vf_net(x, t, context) * dt
-
         return x * self.action_std + self.action_mean   # de-normalise
 
 
@@ -567,29 +591,36 @@ class Args:
     val_fraction: float         = 0.2
     """fraction of EPISODES held out for validation (split before flattening to segments)"""
 
+    # Observation stacking
+    obs_horizon: int = 2
+    """stack last obs_horizon states → gives velocity info, reduces compounding error"""
+
     # Model architecture
     embed_dim:    int = 16
     """embedding dim for action_type and color"""
-    context_dim:  int = 256
-    """SubtaskEncoder output / conditioning vector size"""
-    hidden_dim:   int = 256
-    """MLP hidden layer width"""
+    context_dim:  int = 512
+    """SubtaskEncoder output / conditioning vector size (larger = more expressive)"""
+    hidden_dim:   int = 512
+    """MLP hidden layer width (larger = more expressive)"""
     time_emb_dim: int = 64
     """sinusoidal time embedding dim"""
 
     # Flow-matching inference
-    n_inference_steps: int = 10
-    """Euler ODE steps at evaluation (more → better quality, slower)"""
+    n_inference_steps: int = 20
+    """Euler ODE steps at evaluation — 20 steps gives noticeably smoother actions than 10"""
 
     # Training
-    total_iters:          int   = 100_000
+    total_iters:          int   = 300_000
     batch_size:           int   = 512
-    lr:                   float = 3e-4
+    lr:                   float = 1e-4
+    """lower than 3e-4 → more stable late-stage training with cosine schedule"""
+    ema_decay:            float = 0.995
+    """EMA decay for inference weights; 0.995 suits 300k iters, use 0.999 for longer runs"""
     num_dataload_workers: int   = 0
 
     # Logging / offline eval
     log_freq:      int   = 200
-    eval_freq:     int   = 1_000
+    eval_freq:     int   = 2_000
     acc_threshold: float = 0.05
     """L2 threshold (in raw action space) for counting a prediction as accurate"""
 
@@ -706,17 +737,23 @@ if __name__ == "__main__":
     print(f"Val   — {len(val_episodes)} episodes, {len(val_subtasks)} subtasks, "
           f"{sum(len(s['states']) for s in val_subtasks):,} timesteps")
 
-    # ── Normaliser (fit on train, apply to val) ───────────────────────────
-    train_ds = SubtaskDataset(train_subtasks, fit_normalizer=True)
+    # ── Normaliser + datasets (obs_horizon-aware) ─────────────────────────
+    train_ds = SubtaskDataset(train_subtasks, obs_horizon=args.obs_horizon,
+                              fit_normalizer=True)
+    assert train_ds.state_mean is not None and train_ds.state_std  is not None
+    assert train_ds.action_mean is not None and train_ds.action_std is not None
     val_ds   = SubtaskDataset(
         val_subtasks,
+        obs_horizon = args.obs_horizon,
         state_mean  = train_ds.state_mean,
         state_std   = train_ds.state_std,
         action_mean = train_ds.action_mean,
         action_std  = train_ds.action_std,
     )
 
-    print(f"\nState  mean (first 4): {train_ds.state_mean[:4]}")
+    print(f"\nobs_horizon          : {args.obs_horizon}  "
+          f"(state input dim = {args.obs_horizon * STATE_DIM})")
+    print(f"State  mean (first 4): {train_ds.state_mean[:4]}")
     print(f"State  std  (first 4): {train_ds.state_std[:4]}")
     print(f"Action mean          : {train_ds.action_mean}")
     print(f"Action std           : {train_ds.action_std}")
@@ -734,6 +771,7 @@ if __name__ == "__main__":
 
     # ── Model ──────────────────────────────────────────────────────────────
     policy = SubtaskFlowMatchingPolicy(
+        obs_horizon  = args.obs_horizon,
         embed_dim    = args.embed_dim,
         context_dim  = args.context_dim,
         hidden_dim   = args.hidden_dim,
@@ -744,23 +782,23 @@ if __name__ == "__main__":
         train_ds.action_mean, train_ds.action_std,
     )
 
+    # EMA policy — used for evaluation and final checkpointing.
+    # Keeps a smoothed copy of weights; more stable than the live training weights.
+    ema_policy = copy.deepcopy(policy)
+    ema_policy.eval()
+
     enc_p  = sum(p.numel() for p in policy.encoder.parameters())
     vfn_p  = sum(p.numel() for p in policy.vf_net.parameters())
     tot_p  = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     print(f"\nModel params: {tot_p:,}  (encoder={enc_p:,}, vf_net={vfn_p:,})")
-    print(f"ODE inference steps: {args.n_inference_steps}")
+    print(f"EMA decay: {args.ema_decay}   ODE steps: {args.n_inference_steps}")
 
     optimizer = optim.AdamW(policy.parameters(), lr=args.lr, weight_decay=1e-6)
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.total_iters, eta_min=1e-5)
 
-    # ── Save checkpoint dir + normaliser stats ─────────────────────────────
+    # ── Save checkpoint dir ────────────────────────────────────────────────
     ckpt_dir = f"runs/{run_name}/checkpoints"
     os.makedirs(ckpt_dir, exist_ok=True)
-    # Normaliser stats also stored in the checkpoint buffers, but save .npy
-    # for convenient loading in eval_subtask_sim.py without needing the model
-    np.save(f"{ckpt_dir}/state_mean.npy",  train_ds.state_mean)
-    np.save(f"{ckpt_dir}/state_std.npy",   train_ds.state_std)
-    np.save(f"{ckpt_dir}/action_mean.npy", train_ds.action_mean)
-    np.save(f"{ckpt_dir}/action_std.npy",  train_ds.action_std)
 
     # ── Logging ────────────────────────────────────────────────────────────
     writer = SummaryWriter(f"runs/{run_name}")
@@ -776,15 +814,21 @@ if __name__ == "__main__":
             name=run_name, save_code=True, group="SubtaskBC-BinFill",
         )
 
+    def _save(tag: str, use_ema: bool = True) -> None:
+        sd = ema_policy.state_dict() if use_ema else policy.state_dict()
+        torch.save({"policy_state_dict": sd, "args": vars(args)},
+                   f"{ckpt_dir}/{tag}.pt")
+
     # ── Training loop ──────────────────────────────────────────────────────
     best_eval_fm = float("inf")
     iteration    = 0
     start_time   = time.time()
 
-    hdr = (f"{'Iter':>7}  {'FM_loss':>8}  {'Tr_acc':>7}"
-           f"  {'Eval_FM':>9}  {'Eval_acc':>8}"
+    hdr = (f"{'Iter':>7}  {'FM_loss':>8}  {'LR':>8}"
+           f"  {'EvalFM(EMA)':>11}  {'EvalAcc':>8}"
            f"  {'pick':>6}  {'put':>6}  {'press':>6}  {'s':>5}")
-    print(f"\nTraining for {args.total_iters} iters (batch={args.batch_size})")
+    print(f"\nTraining for {args.total_iters} iters  "
+          f"(batch={args.batch_size}, obs_horizon={args.obs_horizon})")
     print(hdr)
     print("-" * len(hdr))
 
@@ -804,27 +848,32 @@ if __name__ == "__main__":
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            scheduler.step()
+
+            # ── EMA update ───────────────────────────────────────────────
+            with torch.no_grad():
+                for p_ema, p in zip(ema_policy.parameters(), policy.parameters()):
+                    p_ema.data.mul_(args.ema_decay).add_(p.data,
+                                                         alpha=1.0 - args.ema_decay)
 
             if iteration % args.log_freq == 0:
                 writer.add_scalar("train/fm_loss", loss.item(), iteration)
+                writer.add_scalar("train/lr",
+                                  optimizer.param_groups[0]["lr"], iteration)
 
             if iteration % args.eval_freq == 0:
+                # Evaluate the EMA policy (smoother, more representative of sim perf)
                 eval_m = evaluate_offline(
-                    policy, val_loader, device,
+                    ema_policy, val_loader, device,
                     args.n_inference_steps, args.acc_threshold,
                 )
-                with torch.no_grad():
-                    pred_tr = policy.sample(state, atype, color, pixel,
-                                            n_steps=args.n_inference_steps)
-                    gt_tr   = action * policy.action_std + policy.action_mean
-                    tr_acc  = ((pred_tr - gt_tr).norm(dim=-1) < args.acc_threshold).float().mean().item()
-
                 elapsed = time.time() - start_time
+                cur_lr  = optimizer.param_groups[0]["lr"]
                 print(
                     f"{iteration:>7d}"
                     f"  {loss.item():>8.5f}"
-                    f"  {tr_acc:>7.4f}"
-                    f"  {eval_m['eval_fm_loss']:>9.5f}"
+                    f"  {cur_lr:>8.2e}"
+                    f"  {eval_m['eval_fm_loss']:>11.5f}"
                     f"  {eval_m['eval_acc']:>8.4f}"
                     f"  {eval_m.get('eval_acc_pick',  float('nan')):>6.3f}"
                     f"  {eval_m.get('eval_acc_put',   float('nan')):>6.3f}"
@@ -833,39 +882,29 @@ if __name__ == "__main__":
                 )
                 for k, v in eval_m.items():
                     writer.add_scalar(f"eval/{k}", v, iteration)
-                writer.add_scalar("train/accuracy", tr_acc, iteration)
 
                 if eval_m["eval_fm_loss"] < best_eval_fm and args.save_model:
                     best_eval_fm = eval_m["eval_fm_loss"]
-                    torch.save(
-                        {"policy_state_dict": policy.state_dict(), "args": vars(args)},
-                        f"{ckpt_dir}/best_eval_fm_loss.pt",
-                    )
-                    print(f"  → best eval_fm_loss={best_eval_fm:.5f}. Saved.")
+                    _save("best_eval_fm_loss")
+                    print(f"  → EMA best eval_fm_loss={best_eval_fm:.5f}. Saved.")
 
-            if args.save_model and iteration > 0 and iteration % 10_000 == 0:
-                torch.save(
-                    {"policy_state_dict": policy.state_dict(), "args": vars(args)},
-                    f"{ckpt_dir}/iter_{iteration:07d}.pt",
-                )
+            if args.save_model and iteration > 0 and iteration % 50_000 == 0:
+                _save(f"iter_{iteration:07d}")
 
             iteration += 1
 
     # ── Final eval + checkpoint ────────────────────────────────────────────
-    print("\n--- Final offline evaluation ---")
+    print("\n--- Final offline evaluation (EMA policy) ---")
     final_m = evaluate_offline(
-        policy, val_loader, device, args.n_inference_steps, args.acc_threshold
+        ema_policy, val_loader, device, args.n_inference_steps, args.acc_threshold
     )
     for k, v in final_m.items():
         print(f"  {k}: {v:.6f}")
         writer.add_scalar(f"eval/{k}", v, iteration)
 
     if args.save_model:
-        torch.save(
-            {"policy_state_dict": policy.state_dict(), "args": vars(args)},
-            f"{ckpt_dir}/final.pt",
-        )
-        print(f"Final checkpoint saved to {ckpt_dir}/final.pt")
+        _save("final")
+        print(f"Final EMA checkpoint saved to {ckpt_dir}/final.pt")
 
     writer.close()
     if args.track:
