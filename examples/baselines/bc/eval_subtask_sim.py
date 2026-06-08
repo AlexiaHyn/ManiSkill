@@ -246,6 +246,16 @@ def run_episode(
     """
     obs, info = env.reset()
 
+    # Debug: print obs structure once on the first episode
+    if not hasattr(run_episode, "_obs_printed"):
+        run_episode._obs_printed = True
+        if hasattr(obs, "shape"):
+            print(f"[DEBUG] obs type=tensor  shape={obs.shape}  dtype={obs.dtype}")
+        elif hasattr(obs, "keys"):
+            print(f"[DEBUG] obs type=dict  keys={list(obs.keys())}")
+        else:
+            print(f"[DEBUG] obs type={type(obs)}")
+
     # Initialise rolling state buffer (padded with first obs)
     state_buf = StateBuffer(obs_horizon, policy, device)
     state_buf.reset(obs)
