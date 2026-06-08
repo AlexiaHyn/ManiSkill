@@ -246,11 +246,14 @@ def run_episode(
     """
     obs, info = env.reset()
 
-    # Debug: print obs structure once on the first episode
+    # Debug: print obs structure + values once on the first episode
     if not hasattr(run_episode, "_obs_printed"):
         run_episode._obs_printed = True
         if hasattr(obs, "shape"):
+            vals = obs[0].cpu().tolist()
             print(f"[DEBUG] obs type=tensor  shape={obs.shape}  dtype={obs.dtype}")
+            for i, v in enumerate(vals):
+                print(f"  obs[0,{i:2d}] = {v: .6f}")
         elif hasattr(obs, "keys"):
             print(f"[DEBUG] obs type=dict  keys={list(obs.keys())}")
         else:
