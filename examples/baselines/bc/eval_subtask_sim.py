@@ -179,6 +179,14 @@ class StateBuffer:
         for _ in range(self.obs_horizon):
             self._buf.append(first.copy())
 
+    def reset_from_h5(self, raw_state: np.ndarray) -> None:
+        """Fill window with a pre-loaded H5 state (16-D raw, not normalised).
+        Guarantees the initial observation exactly matches training data."""
+        normalised = (raw_state.astype(np.float32) - self._s_mean) / self._s_std
+        self._buf.clear()
+        for _ in range(self.obs_horizon):
+            self._buf.append(normalised.copy())
+
     def push(self, env) -> None:
         """Append current robot state; oldest is automatically evicted."""
         self._buf.append(self._extract_normalised(env))
@@ -256,18 +264,21 @@ class SubtaskQueue:
 @torch.no_grad()
 def run_episode(
     env,
-    policy:        SubtaskFlowMatchingPolicy,
-    device:        torch.device,
-    n_steps:       int,
-    max_steps:     int,
-    action_format: str,
-    obs_horizon:   int,
+    policy:               SubtaskFlowMatchingPolicy,
+    device:               torch.device,
+    n_steps:              int,
+    max_steps:            int,
+    action_format:        str,
+    obs_horizon:          int,
+    initial_subgoal_text: Optional[str]       = None,
+    initial_raw_state:    Optional[np.ndarray] = None,
 ) -> Dict:
     """
     Execute one full episode driven by the subtask-queue policy.
 
-    For H5 sim eval, create the env with the episode's seed before calling
-    this function so the scene exactly matches the recorded episode.
+    For H5 sim eval pass initial_subgoal_text and initial_raw_state (from the
+    H5 first timestep) so the policy's first input exactly matches training.
+    The env must already be constructed with the episode's seed before calling.
 
     Boundary detection
     ------------------
@@ -280,13 +291,21 @@ def run_episode(
     """
     obs, info = env.reset()
 
-    # Initialise rolling state buffer (reads SAPIEN robot state, not flat obs tensor)
+    # Initialise rolling state buffer
     state_buf = StateBuffer(obs_horizon, policy, device)
-    state_buf.reset(env)
+    if initial_raw_state is not None:
+        # Use H5-recorded state so initial input matches training exactly
+        state_buf.reset_from_h5(initial_raw_state)
+    else:
+        state_buf.reset(env)
 
-    # Initialise TODO queue from the very first subgoal
-    initial_sg = _decode_info_str(info.get("grounded_subgoal_online", "pick up the object"))
-    queue      = SubtaskQueue(initial_sg)
+    # Initialise TODO queue — prefer H5 subgoal text (has pixel coordinates);
+    # fall back to live info only when not doing H5 replay
+    if initial_subgoal_text is not None:
+        initial_sg = initial_subgoal_text
+    else:
+        initial_sg = _decode_info_str(info.get("grounded_subgoal_online", "pick up the object"))
+    queue = SubtaskQueue(initial_sg)
 
     ep_steps        = 0
     episode_success = False
@@ -486,8 +505,10 @@ if __name__ == "__main__":
             print(f"\n[ERROR] Cannot import RoboMME BinFill for H5 sim eval: {exc}")
             raise
 
-        print(f"\nLoading H5 episode seeds from {args.h5_file} ...")
-        _, episode_setups = load_subtasks_from_h5(args.h5_file, args.num_h5_episodes)
+        print(f"\nLoading H5 episodes from {args.h5_file} ...")
+        episodes_subtasks, episode_setups = load_subtasks_from_h5(
+            args.h5_file, args.num_h5_episodes
+        )
         n_ep_h5 = len(episode_setups)
 
         rng   = np.random.default_rng(args.h5_split_seed)
@@ -511,16 +532,25 @@ if __name__ == "__main__":
             # layout is guaranteed to match what the policy was trained on.
             split_results: List[Dict] = []
             for ep_counter, idx in enumerate(indices):
-                setup  = episode_setups[idx]
+                setup      = episode_setups[idx]
+                ep_subtasks = episodes_subtasks[idx]
+
+                # Use H5 first-timestep data so the policy's initial input
+                # exactly matches what it saw during training
+                h5_first_state   = ep_subtasks[0]["states"][0]   if ep_subtasks else None
+                h5_first_subgoal = ep_subtasks[0]["subgoal_text"] if ep_subtasks else None
+
                 h5_env = _BinFill(difficulty=setup["difficulty"], seed=setup["seed"])
                 r = run_episode(
-                    env           = h5_env,
-                    policy        = policy,
-                    device        = device,
-                    n_steps       = args.n_inference_steps,
-                    max_steps     = args.max_episode_steps,
-                    action_format = args.action_format,
-                    obs_horizon   = obs_horizon,
+                    env                  = h5_env,
+                    policy               = policy,
+                    device               = device,
+                    n_steps              = args.n_inference_steps,
+                    max_steps            = args.max_episode_steps,
+                    action_format        = args.action_format,
+                    obs_horizon          = obs_horizon,
+                    initial_subgoal_text = h5_first_subgoal,
+                    initial_raw_state    = h5_first_state,
                 )
                 h5_env.close()
                 r["difficulty"]  = setup["difficulty"]
