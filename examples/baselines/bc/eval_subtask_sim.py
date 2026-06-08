@@ -452,7 +452,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
     print(f"Device          : {device}")
     print(f"Checkpoint      : {args.checkpoint}")
-    print(f"Difficulty      : {args.env_difficulty}")
+    print(f"Dataset         : {args.h5_file if args.h5_file else args.dataset}")
     print(f"Eval episodes   : {args.num_eval_episodes}")
     print(f"Max ep steps    : {args.max_episode_steps}")
     print(f"ODE steps       : {args.n_inference_steps}")
