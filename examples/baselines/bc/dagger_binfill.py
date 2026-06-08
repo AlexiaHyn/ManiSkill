@@ -413,8 +413,13 @@ def collect_expert_trajectory(
 
     obs, info, demo_wrapper = bypass_demo_reset(env)
 
+    # The planner calls self.env.step() on whatever env we pass here.
+    # We pass demo_wrapper so the planner's steps go through DemonstrationWrapper
+    # (which provides subgoal tracking). We then monkey-patch demo_wrapper.step
+    # to intercept every joint action the planner sends.
+    planner_env = demo_wrapper if demo_wrapper is not None else env
     planner = PandaArmMotionPlanningSolver(
-        demo_wrapper if demo_wrapper is not None else env,
+        planner_env,
         debug=False,
         vis=False,
         base_pose=env.unwrapped.agent.robot.pose,
@@ -425,15 +430,17 @@ def collect_expert_trajectory(
     transitions: List[Dict] = []
     step_count = [0]  # mutable cell for closure
 
-    prev_subgoal = ""
-    is_completed  = 0.0
+    prev_subgoal        = ""
+    is_completed        = 0.0
     is_subgoal_boundary = 0.0
-    subgoal_count = 0
+    subgoal_count       = 0
 
     difficulty = ep_meta.get("difficulty", "easy")
     task_goal  = ep_meta.get("task_goal", "")
 
-    original_step = env.step
+    # Patch planner_env.step so every action the planner sends is captured.
+    # env.unwrapped is always BinFill regardless of which wrapper we patch.
+    original_step = planner_env.step
 
     def recording_step(action):
         nonlocal prev_subgoal, is_completed, is_subgoal_boundary, subgoal_count
@@ -441,7 +448,6 @@ def collect_expert_trajectory(
         if step_count[0] >= max_steps:
             return original_step(action)
 
-        # Current subgoal from live env
         raw_subgoal = str(getattr(env.unwrapped, "current_task_name", "") or "")
         s_action, s_count, s_color = parse_subgoal(raw_subgoal)
 
@@ -451,7 +457,7 @@ def collect_expert_trajectory(
         else:
             is_subgoal_boundary = 0.0
 
-        # Build rich obs BEFORE the step
+        # Rich obs from the outer env (env.unwrapped == BinFill either way)
         try:
             rich_cont = build_rich_cont(
                 env, cam_intrinsics,
@@ -462,32 +468,31 @@ def collect_expert_trajectory(
 
         cat_ids = build_rich_cat_ids(difficulty, task_goal, s_action, s_color, vocabs)
 
-        # Normalise joint action to 8-D float64
-        act_np = _to_np(action, dtype=np.float64)
-        if len(act_np) < 8:
-            act_np = np.pad(act_np, (0, 8 - len(act_np)))
-        else:
-            act_np = act_np[:8]
+        # Normalise to 8-D float32 joint action
+        act_np = _to_np(action, dtype=np.float32)
+        act_np = act_np[:8] if len(act_np) >= 8 else np.pad(act_np, (0, 8 - len(act_np)))
 
         result = original_step(action)
 
         obs_r, reward, terminated, truncated, info_r = result
         status = info_r.get("status", "ongoing") if isinstance(info_r, dict) else "ongoing"
         is_completed = 1.0 if status == "success" else 0.0
-
-        prev_subgoal = str(info_r.get("simple_subgoal_online", raw_subgoal)) if isinstance(info_r, dict) else raw_subgoal
+        prev_subgoal = (
+            str(info_r.get("simple_subgoal_online", raw_subgoal))
+            if isinstance(info_r, dict) else raw_subgoal
+        )
 
         if rich_cont is not None:
             transitions.append({
                 "rich_cont": rich_cont,
                 "cat_ids":   cat_ids,
-                "action":    act_np.astype(np.float32),
+                "action":    act_np,
             })
 
         step_count[0] += 1
         return result
 
-    env.step = recording_step
+    planner_env.step = recording_step
 
     try:
         task_list = getattr(env.unwrapped, "task_list", [])
@@ -498,16 +503,12 @@ def collect_expert_trajectory(
             if solve_fn is None:
                 continue
             try:
-                solve_fn(demo_wrapper if demo_wrapper is not None else env, planner)
+                solve_fn(planner_env, planner)
             except Exception as exc:
                 if verbose:
                     print(f"[Expert] solve failed for task '{task.get('name')}': {exc}")
     finally:
-        env.step = original_step
-        try:
-            planner.close()
-        except Exception:
-            pass
+        planner_env.step = original_step
 
     if verbose:
         print(f"[Expert] collected {len(transitions)} steps")
@@ -1094,6 +1095,11 @@ def parse_args():
     p.add_argument("--eval_freq",          type=int, default=5000,
                    help="Evaluate every this many pre-training gradient steps")
 
+    p.add_argument("--dataset",            default="train",
+                   choices=["train", "test"],
+                   help="Which robomme metadata set the h5 file belongs to "
+                        "(passed to BenchmarkEnvBuilder as dataset=)")
+
     p.add_argument("--cuda",               action="store_true", default=True)
     p.add_argument("--no_cuda",            dest="cuda", action="store_false")
     p.add_argument("--verbose",            action="store_true", default=False)
@@ -1122,9 +1128,16 @@ def main():
 
     # ------------------------------------------------------------------
     # Import env builder (requires robomme on path)
+    # robomme.robomme_env must be imported first to register BinFill with gym
     # ------------------------------------------------------------------
-    from robomme.env_record_wrapper.episode_config_resolver import BenchmarkEnvBuilder
-    env_builder = BenchmarkEnvBuilder(h5_file=args.h5_file)
+    import robomme.robomme_env  # noqa: F401 — registers BinFill (and all tasks) with gym
+    from robomme.env_record_wrapper import BenchmarkEnvBuilder
+
+    env_builder = BenchmarkEnvBuilder(
+        env_id       = "BinFill",
+        dataset      = args.dataset,
+        action_space = "joint_angle",  # expert outputs joint-space actions directly
+    )
 
     # ------------------------------------------------------------------
     # Build vocabs from h5
